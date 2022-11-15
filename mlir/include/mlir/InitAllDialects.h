@@ -31,6 +31,7 @@
 #include "mlir/Dialect/EmitC/IR/EmitC.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/KV/IR/KV.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
@@ -85,6 +86,7 @@ inline void registerAllDialects(DialectRegistry &registry) {
                   emitc::EmitCDialect,
                   func::FuncDialect,
                   gpu::GPUDialect,
+                  kv::KVDialect,
                   LLVM::LLVMDialect,
                   linalg::LinalgDialect,
                   math::MathDialect,
