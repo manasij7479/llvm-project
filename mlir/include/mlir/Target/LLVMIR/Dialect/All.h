@@ -23,6 +23,7 @@
 #include "mlir/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/ROCDL/ROCDLToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/X86Vector/X86VectorToLLVMIRTranslation.h"
+#include "mlir/Target/LLVMIR/Dialect/KV/KVToLLVMIRTranslation.h"
 
 namespace mlir {
 class DialectRegistry;
@@ -39,6 +40,7 @@ static inline void registerAllToLLVMIRTranslations(DialectRegistry &registry) {
   registerOpenMPDialectTranslation(registry);
   registerROCDLDialectTranslation(registry);
   registerX86VectorDialectTranslation(registry);
+  registerKVDialectTranslation(registry);
 }
 } // namespace mlir
 

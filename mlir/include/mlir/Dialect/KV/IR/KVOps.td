@@ -61,13 +61,17 @@ def NoOp : KV_Op<"nop", [NoSideEffect]> {
 def GetOp : KV_Op<"get", [NoSideEffect]> {
   let summary = "get";
   let arguments = (ins LLVM_AnyPointer:$ctx, I32:$key);
-  let results = (outs LLVM_AnyPointer);
+  let results = (outs LLVM_AnyPointer:$res);
+
+  string llvmBuilder = [{
+    $res = builder.CreateRetVoid();
+  }];
 }
 
 def SetOp : KV_Op<"set", []> {
   let summary = "set";
   let arguments = (ins LLVM_AnyPointer:$ctx, I32:$key, I32:$value);
-  let results = (outs LLVM_AnyPointer);
+  let results = (outs LLVM_AnyPointer:$res);
   let hasCanonicalizer = 1;
 }
 
