@@ -28,10 +28,16 @@ using namespace mlir::kv;
 // TableGen'd canonicalization patterns
 //===----------------------------------------------------------------------===//
 
-// namespace {
-// #include "ArithmeticCanonicalization.inc"
-// } // namespace
+namespace {
+#include "KVCanonicalization.inc"
+} // namespace
 
+
+void kv::SetOp::getCanonicalizationPatterns(RewritePatternSet &patterns,
+                                                MLIRContext *context) {
+  patterns.add<KVTestPattern>(
+      context);
+}
 
 
 //===----------------------------------------------------------------------===//
@@ -40,6 +46,8 @@ using namespace mlir::kv;
 
 #define GET_OP_CLASSES
 #include "mlir/Dialect/KV/IR/KVOps.cpp.inc"
+
+
 
 //===----------------------------------------------------------------------===//
 // TableGen'd enum attribute definitions

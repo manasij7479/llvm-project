@@ -68,6 +68,7 @@ def SetOp : KV_Op<"set", []> {
   let summary = "set";
   let arguments = (ins LLVM_AnyPointer:$ctx, I32:$key, I32:$value);
   let results = (outs LLVM_AnyPointer);
+  let hasCanonicalizer = 1;
 }
 
 def IncrOp : KV_Op<"incr", []> {
