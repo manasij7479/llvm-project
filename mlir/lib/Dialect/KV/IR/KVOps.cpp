@@ -35,7 +35,8 @@ namespace {
 
 void kv::SetOp::getCanonicalizationPatterns(RewritePatternSet &patterns,
                                                 MLIRContext *context) {
-  patterns.add<KVTestPattern>(
+  patterns.add<KVTestPattern,
+               KVRCUPattern>(
       context);
 }
 

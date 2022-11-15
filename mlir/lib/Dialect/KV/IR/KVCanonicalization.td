@@ -11,9 +11,15 @@
 
 include "mlir/IR/PatternBase.td"
 include "mlir/Dialect/KV/IR/KVOps.td"
+include "mlir/Dialect/LLVMIR/LLVMOps.td"
 
 def KVTestPattern :
-    Pat<(SetOp $ctx, $k, $v),
-        (GetOp $ctx, $k)>;
+  Pat<(SetOp $ctx, $k, $v),
+      (GetOp $ctx, $k)>;
+
+def KVRCUPattern :
+  Pat<(SetOp $ctx, $k,
+    (LLVM_AddOp $amount, (IvOp(GetOp $ctx, $k)))),
+  (IncrOp $ctx, $k, $amount)>;
 
 #endif // KV_PATTERNS
