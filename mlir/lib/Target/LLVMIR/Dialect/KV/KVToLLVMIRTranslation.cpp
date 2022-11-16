@@ -36,15 +36,15 @@ convertOperationImpl(Operation &opInst, llvm::IRBuilderBase &builder,
   // #include "mlir/Dialect/KV/KVConversions.inc"
   // Okay to just write C++ for this I think
 
-  if (auto op = dyn_cast<kv::GetOp>(opInst)) {
-    moduleTranslation.mapValue(op.getRes()) = builder.CreateRetVoid();
-    return success();
-  }
+  // if (auto op = dyn_cast<kv::GetOp>(opInst)) {
+  //   moduleTranslation.mapValue(op.getRes()) = builder.CreateRetVoid();
+  //   return success();
+  // }
 
-  if (auto op = dyn_cast<kv::SetOp>(opInst)) {
-    moduleTranslation.mapValue(op.getRes()) = builder.CreateRetVoid();
-    return success();
-  }
+  // if (auto op = dyn_cast<kv::SetOp>(opInst)) {
+  //   moduleTranslation.mapValue(op.getRes()) = builder.CreateRetVoid();
+  //   return success();
+  // }
 
   return failure();
 }
