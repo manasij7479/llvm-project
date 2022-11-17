@@ -15,10 +15,9 @@ using namespace mlir::kv;
 
 #include "mlir/Dialect/KV/IR/KVOpsDialect.cpp.inc"
 
-void kv::KVDialect::initialize() {
+void mlir::kv::KVDialect::initialize() {
   addOperations<
 #define GET_OP_LIST
 #include "mlir/Dialect/KV/IR/KVOps.cpp.inc"
       >();
 }
-

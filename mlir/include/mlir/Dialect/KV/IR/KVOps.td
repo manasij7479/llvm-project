@@ -119,8 +119,8 @@ def GetSetOp : KV_Op<"getset", [NoSideEffect]> {
   let results = (outs AnyTypeOf<[I32, LLVM_AnyPointer]>:$res);
 }
 
-def DelOp : KV_Op<"set", []> {
-  let summary = "set";
+def DelOp : KV_Op<"del", []> {
+  let summary = "del";
   let arguments = (ins LLVM_AnyPointer:$ctx,
                    AnyTypeOf<[I32, LLVM_AnyPointer]>:$key,
                    AnyTypeOf<[I32, LLVM_AnyPointer]>:$value);
@@ -148,9 +148,9 @@ def ExistsOp : KV_Op<"exists", []> {
   let results = (outs I32);
 }
 
-// TODO add list operations
+// TODO Add operations which require loop matching
 
-// TODO loop primitives
+// TODO add list operations
 
 // TODO Custom function with string attribute 
 

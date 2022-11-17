@@ -5,6 +5,7 @@ add_public_tablegen_target(MLIRKVCanonicalizationIncGen)
 add_mlir_dialect_library(MLIRKVDialect
   KVOps.cpp
   KVDialect.cpp
+  KVPass.cpp
   
   ADDITIONAL_HEADER_DIRS
   ${MLIR_MAIN_INCLUDE_DIR}/mlir/Dialect/KV

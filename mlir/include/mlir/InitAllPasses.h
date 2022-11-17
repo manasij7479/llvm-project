@@ -34,12 +34,12 @@
 #include "mlir/Dialect/Tosa/Transforms/Passes.h"
 #include "mlir/Dialect/Transform/Transforms/Passes.h"
 #include "mlir/Dialect/Vector/Transforms/Passes.h"
+#include "mlir/Dialect/KV/IR/Pass.h"
 #include "mlir/Transforms/Passes.h"
 
 #include <cstdlib>
 
 namespace mlir {
-
 // This function may be called to register the MLIR passes with the
 // global registry.
 // If you're building a compiler, you likely don't need this: you would build a
@@ -75,6 +75,8 @@ inline void registerAllPasses() {
   tosa::registerTosaOptPasses();
   transform::registerTransformPasses();
   vector::registerVectorPasses();
+
+  kv::registerKVPasses();
 
   // Dialect pipelines
   sparse_tensor::registerSparseTensorPipelines();
