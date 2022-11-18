@@ -122,8 +122,7 @@ def GetSetOp : KV_Op<"getset", [NoSideEffect]> {
 def DelOp : KV_Op<"del", []> {
   let summary = "del";
   let arguments = (ins LLVM_AnyPointer:$ctx,
-                   AnyTypeOf<[I32, LLVM_AnyPointer]>:$key,
-                   AnyTypeOf<[I32, LLVM_AnyPointer]>:$value);
+                   AnyTypeOf<[I32, LLVM_AnyPointer]>:$key);
 }
 
 def IncrByOp : KV_Op<"incrby", []> {
@@ -143,7 +142,7 @@ def HIncrByOp : KV_Op<"hincrby", []> {
 
 def ExistsOp : KV_Op<"exists", []> {
   let summary = "exists";
-  let arguments = (ins LLVM_AnyPointer:$ctx, 
+  let arguments = (ins LLVM_AnyPointer:$ctx,
                        AnyTypeOf<[I32, LLVM_AnyPointer]>:$key);
   let results = (outs I32);
 }
@@ -152,6 +151,6 @@ def ExistsOp : KV_Op<"exists", []> {
 
 // TODO add list operations
 
-// TODO Custom function with string attribute 
+// TODO Custom function with string attribute
 
 #endif // KV_BASE
