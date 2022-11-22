@@ -209,24 +209,17 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
     return LLVM::createGlobalString(Root->getLoc(), B, Name, Str, LLVM::linkage::Linkage::Internal);
   }
 
-//   mlir::Operation *getCallOp() // TODO implement abstraction
-
-  bool replaceInst(mlir::Operation *Op, mlir::Operation *RedisCmd,
-                                  mlir::MLIRContext *Ctx) {
+  bool replaceInst(mlir::Operation *Op, LLVM::LLVMFuncOp RedisF,
+                   LLVM::LLVMFuncOp FreeF, mlir::MLIRContext *Ctx) {
     mlir::OpBuilder B(Ctx);
     B.setInsertionPoint(Op);
     if (isa<kv::GetOp>(Op)) {
-      TypeRange ResultType = dyn_cast<LLVM::LLVMFuncOp>(RedisCmd).getFunctionType().getReturnTypes();
       auto Str = getGlobalString(Op, "GET %s", Ctx);
       // TODO: The format string has to change for int arguments
 
       ValueRange Args{Op->getOperand(0), Str, Op->getOperand(1)};
-      auto APICall = B.create<LLVM::CallOp>(Op->getLoc(), ResultType, "redisCommand", Args);
+      auto APICall = B.create<LLVM::CallOp>(Op->getLoc(), RedisF, Args);
       Value BasePtr = APICall.getResult();
-
-      // It doesn't work without setting this type manually, could be a bug in MLIR.
-      // dyn_cast fails, somehow llvm.ptr<i8> is not {de}/serialized correctly.
-      BasePtr.setType(LLVM::LLVMPointerType::get(IntegerType::get(Ctx, 8)));
 
       auto GEP = B.create<LLVM::GEPOp>(Op->getLoc(), Op->getResult(0).getType(), BasePtr, ArrayRef<LLVM::GEPArg>{32});
       // TODO: The index 32 is for the string result, observe the value for string and branch accordingly.
@@ -237,37 +230,32 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
       for (auto &&Use : Op->getUses()) {
         B.setInsertionPointAfterValue(Use.get()); // Verify that this works as we expect
       }
-      TypeRange Empty;
       ValueRange FreeArgs{APICall.getResult()};
-      B.create<LLVM::CallOp>(Op->getLoc(), Empty, "freeReplyObject", FreeArgs);
+      B.create<LLVM::CallOp>(Op->getLoc(), FreeF, FreeArgs);
 
       Op->replaceAllUsesWith(GEP);
 
       return true;
     } else if (isa<kv::SetOp>(Op)) {
-      TypeRange ResultType = dyn_cast<LLVM::LLVMFuncOp>(RedisCmd).getFunctionType().getReturnTypes();
       auto Str = getGlobalString(Op, "SET %s %s", Ctx);
       // TODO: The format string has to change for int arguments
 
       ValueRange Args{Op->getOperand(0), Str, Op->getOperand(1), Op->getOperand(2)};
-      auto APICall = B.create<LLVM::CallOp>(Op->getLoc(), ResultType, "redisCommand", Args);
+      auto APICall = B.create<LLVM::CallOp>(Op->getLoc(), RedisF, Args);
 
-      TypeRange Empty;
       ValueRange FreeArgs{APICall.getResult()};
-      B.create<LLVM::CallOp>(Op->getLoc(), Empty, "freeReplyObject", FreeArgs);
+      B.create<LLVM::CallOp>(Op->getLoc(), FreeF, FreeArgs);
 
       return true;
     } else if (isa<kv::DelOp>(Op)) {
-      TypeRange ResultType = dyn_cast<LLVM::LLVMFuncOp>(RedisCmd).getFunctionType().getReturnTypes();
       auto Str = getGlobalString(Op, "DEL %s", Ctx);
       // TODO: The format string has to change for int arguments
 
       ValueRange Args{Op->getOperand(0), Str, Op->getOperand(1)};
-      auto APICall = B.create<LLVM::CallOp>(Op->getLoc(), ResultType, "redisCommand", Args);
+      auto APICall = B.create<LLVM::CallOp>(Op->getLoc(), RedisF, Args);
 
-      TypeRange Empty;
       ValueRange FreeArgs{APICall.getResult()};
-      B.create<LLVM::CallOp>(Op->getLoc(), Empty, "freeReplyObject", FreeArgs);
+      B.create<LLVM::CallOp>(Op->getLoc(), FreeF, FreeArgs);
 
       return true;
     }
@@ -276,10 +264,12 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
   }
 
   void runOnFunction(LLVM::LLVMFuncOp &F, SymbolTableCollection *STC) override {
-    auto redisCommand = SymbolRefAttr::get(&getContext(), "redisCommand");
-    auto redisCommandF = STC->lookupNearestSymbolFrom<LLVM::LLVMFuncOp>(F, redisCommand);
+    LLVM::LLVMFuncOp RedisF = STC->lookupNearestSymbolFrom<LLVM::LLVMFuncOp>(F,
+                              SymbolRefAttr::get(&getContext(), "redisCommand"));
+    LLVM::LLVMFuncOp FreeF = STC->lookupNearestSymbolFrom<LLVM::LLVMFuncOp>(F,
+                              SymbolRefAttr::get(&getContext(), "freeReplyObject"));
 
-    if (!redisCommandF) {
+    if (!RedisF || !FreeF) {
       llvm::errs() << "Symbol table lookup failed.\n";
       return;
     }
@@ -287,7 +277,7 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
     for (auto &&B : F.getRegion()) {
       std::vector<Operation *> ToRemove;
       for (auto &&Instruction : B.getOperations()) {
-        if (replaceInst(&Instruction, redisCommandF, &getContext())) {
+        if (replaceInst(&Instruction, RedisF, FreeF, &getContext())) {
           ToRemove.push_back(&Instruction);
         }
       }
