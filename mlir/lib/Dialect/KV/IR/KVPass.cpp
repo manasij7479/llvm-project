@@ -201,12 +201,14 @@ MLIR_MAGIC_INCANTATIONS(LLVMToKVPass, "llvm-to-kv", "LLVM to KV")
 struct KVToLLVMPass : LLVMFunctionPass<KVToLLVMPass> {
 MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
 
-  mlir::Value getGlobalString(mlir::Operation *Root, StringRef Str, mlir::MLIRContext *Ctx) {
-    mlir::OpBuilder B(Ctx);
+  mlir::Value getGlobalString(mlir::Operation *Root, StringRef Str) {
+    mlir::OpBuilder B(Root->getContext());
     static int StrNum = 0;
     auto Name = "s" + std::to_string(StrNum++);
+    SmallString<16> NullTerminatedStr(Str);
+    NullTerminatedStr.push_back('\0');
     B.setInsertionPoint(Root);
-    return LLVM::createGlobalString(Root->getLoc(), B, Name, Str, LLVM::linkage::Linkage::Internal);
+    return LLVM::createGlobalString(Root->getLoc(), B, Name, NullTerminatedStr, LLVM::linkage::Linkage::Internal);
   }
 
   template <typename ...Args>
@@ -223,11 +225,31 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
 
   void ReplaceUses(mlir::OpBuilder &B, mlir::Operation *Root, mlir::Operation *New) {
     B.setInsertionPointAfter(New);
-    // TODO: Is it possible to get the last use without traversing all the uses?
-    for (auto &&Use : Root->getUses()) {
-      B.setInsertionPointAfterValue(Use.get()); // Verify that this works as we expect
+    // TODO: Is it possible to get the last dependent use without traversing the use tree?
+    std::vector<mlir::Operation *> Stack{Root};
+    std::set<mlir::Operation *> Visited;
+    while (!Stack.empty()) {
+      auto Cur = Stack.back();
+      Stack.pop_back();
+      if (Visited.find(Cur) != Visited.end()) {
+        continue;
+      }
+      Visited.insert(Cur);
+      B.setInsertionPointAfter(Cur);
+      for (auto &&User : Cur->getUsers()) {
+        Stack.push_back(User);
+      }
     }
+
     Root->replaceAllUsesWith(New);
+  }
+
+  std::string FMT(mlir::Value V) {
+    if (V.getType().isInteger(32)) {
+      return "%i ";
+    } else {
+      return "%s ";
+    }
   }
 
   bool replaceInst(mlir::Operation *Op, LLVM::LLVMFuncOp RedisF,
@@ -235,9 +257,8 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
     mlir::OpBuilder B(Ctx);
     B.setInsertionPoint(Op);
     if (isa<kv::GetOp>(Op)) {
-      auto Str = getGlobalString(Op, "GET %s", Ctx);
-      // TODO: The format string has to change for int arguments
-
+      mlir::Value Str;
+      Str = getGlobalString(Op, "GET " + FMT(Op->getOperand(1)));
       Value BasePtr = Call(B, Op, RedisF, Op->getOperand(0), Str, Op->getOperand(1));
 
       auto Ptr = GEP(B, Op, BasePtr, 32);
@@ -247,15 +268,13 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
       return true;
 
     } else if (isa<kv::SetOp>(Op)) {
-      auto Str = getGlobalString(Op, "SET %s %s", Ctx);
-      // TODO: The format string has to change for int arguments
+      auto Str = getGlobalString(Op, "SET " + FMT(Op->getOperand(1)) + FMT(Op->getOperand(2)));
       auto BasePtr = Call(B, Op, RedisF, Op->getOperand(0), Str, Op->getOperand(1), Op->getOperand(2));
       Call(B, Op, FreeF, BasePtr);
       return true;
 
     } else if (isa<kv::DelOp>(Op)) {
-      auto Str = getGlobalString(Op, "DEL %s", Ctx);
-      // TODO: The format string has to change for int arguments
+      auto Str = getGlobalString(Op, "DEL " + FMT(Op->getOperand(1)));
       auto BasePtr = Call(B, Op, RedisF, Op->getOperand(0), Str, Op->getOperand(1));
       Call(B, Op, FreeF, BasePtr);
       return true;
