@@ -209,6 +209,27 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
     return LLVM::createGlobalString(Root->getLoc(), B, Name, Str, LLVM::linkage::Linkage::Internal);
   }
 
+  template <typename ...Args>
+  Value Call(mlir::OpBuilder B, mlir::Operation *Root, LLVM::LLVMFuncOp F, Args... args) {
+    ValueRange CallArgs{args...};
+    return B.create<LLVM::CallOp>(Root->getLoc(), F, CallArgs).getResult();
+  }
+
+  template <typename ...Args>
+  LLVM::GEPOp GEP(mlir::OpBuilder B, mlir::Operation *Root, Value Ptr, Args... idx) {
+    return B.create<LLVM::GEPOp>(Root->getLoc(), Root->getResult(0).getType(),
+                                 Ptr, ArrayRef<LLVM::GEPArg>{idx...});
+  }
+
+  void ReplaceUses(mlir::OpBuilder &B, mlir::Operation *Root, mlir::Operation *New) {
+    B.setInsertionPointAfter(New);
+    // TODO: Is it possible to get the last use without traversing all the uses?
+    for (auto &&Use : Root->getUses()) {
+      B.setInsertionPointAfterValue(Use.get()); // Verify that this works as we expect
+    }
+    Root->replaceAllUsesWith(New);
+  }
+
   bool replaceInst(mlir::Operation *Op, LLVM::LLVMFuncOp RedisF,
                    LLVM::LLVMFuncOp FreeF, mlir::MLIRContext *Ctx) {
     mlir::OpBuilder B(Ctx);
@@ -217,49 +238,29 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
       auto Str = getGlobalString(Op, "GET %s", Ctx);
       // TODO: The format string has to change for int arguments
 
-      ValueRange Args{Op->getOperand(0), Str, Op->getOperand(1)};
-      auto APICall = B.create<LLVM::CallOp>(Op->getLoc(), RedisF, Args);
-      Value BasePtr = APICall.getResult();
+      Value BasePtr = Call(B, Op, RedisF, Op->getOperand(0), Str, Op->getOperand(1));
 
-      auto GEP = B.create<LLVM::GEPOp>(Op->getLoc(), Op->getResult(0).getType(), BasePtr, ArrayRef<LLVM::GEPArg>{32});
-      // TODO: The index 32 is for the string result, observe the value for string and branch accordingly.
-
-      B.setInsertionPointAfter(GEP);
-
-      // TODO: Is it possible to get the last use without traversing all the uses?
-      for (auto &&Use : Op->getUses()) {
-        B.setInsertionPointAfterValue(Use.get()); // Verify that this works as we expect
-      }
-      ValueRange FreeArgs{APICall.getResult()};
-      B.create<LLVM::CallOp>(Op->getLoc(), FreeF, FreeArgs);
-
-      Op->replaceAllUsesWith(GEP);
-
+      auto Ptr = GEP(B, Op, BasePtr, 32);
+      // TODO: The index 32 is for the string result, observe the value for int and branch accordingly.
+      ReplaceUses(B, Op, Ptr);
+      Call(B, Op, FreeF, BasePtr);
       return true;
+
     } else if (isa<kv::SetOp>(Op)) {
       auto Str = getGlobalString(Op, "SET %s %s", Ctx);
       // TODO: The format string has to change for int arguments
-
-      ValueRange Args{Op->getOperand(0), Str, Op->getOperand(1), Op->getOperand(2)};
-      auto APICall = B.create<LLVM::CallOp>(Op->getLoc(), RedisF, Args);
-
-      ValueRange FreeArgs{APICall.getResult()};
-      B.create<LLVM::CallOp>(Op->getLoc(), FreeF, FreeArgs);
-
+      auto BasePtr = Call(B, Op, RedisF, Op->getOperand(0), Str, Op->getOperand(1), Op->getOperand(2));
+      Call(B, Op, FreeF, BasePtr);
       return true;
+
     } else if (isa<kv::DelOp>(Op)) {
       auto Str = getGlobalString(Op, "DEL %s", Ctx);
       // TODO: The format string has to change for int arguments
-
-      ValueRange Args{Op->getOperand(0), Str, Op->getOperand(1)};
-      auto APICall = B.create<LLVM::CallOp>(Op->getLoc(), RedisF, Args);
-
-      ValueRange FreeArgs{APICall.getResult()};
-      B.create<LLVM::CallOp>(Op->getLoc(), FreeF, FreeArgs);
-
+      auto BasePtr = Call(B, Op, RedisF, Op->getOperand(0), Str, Op->getOperand(1));
+      Call(B, Op, FreeF, BasePtr);
       return true;
     }
-    // TODO: Create abstractions to make it easier to add more ops
+
     return false;
   }
 
