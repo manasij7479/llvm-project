@@ -39,11 +39,6 @@ struct LLVMFunctionPass
     llvm_unreachable("Abstract LLVMFunctionPass getDescription");
   }
 
-  struct PeepContext {
-    mlir::Block *B;
-    std::vector<mlir::Operation *> Ops; // Only relevant operations, not all.
-  };
-
   virtual void runOnFunction(LLVM::LLVMFuncOp &F,
                              SymbolTableCollection *SymTab) {};
   virtual void runOnBasicBlock(mlir::Block &B,
@@ -59,28 +54,13 @@ struct LLVMFunctionPass
     for (auto &&R : Op->getRegions()) {
       for (auto &&B : R.getBlocks()) {
         for (auto &&Global : B.getOperations()) {
-
           if (auto &&Function = llvm::dyn_cast<LLVM::LLVMFuncOp>(&Global)) {
             runOnFunction(Function, &STC);
             for (auto &&Block : Function.getRegion()) {
               runOnBasicBlock(Block, &STC);
-              std::vector<mlir::Operation *> KVOps;
               for (auto &&Instruction : Block.getOperations()) {
                 runOnInstruction(Instruction, &STC);
-                if (Instruction.getDialect() && Instruction.getDialect()->getNamespace() == "kv") {
-                  KVOps.push_back(&Instruction);
-                }
               }
-              PeepContext P;
-              P.B = &Block;
-              P.Ops = KVOps;
-              if (KVOps.size() >= 2) {
-                // make sure we handle folds separately
-                for (auto &&Peep : Peeps) {
-                  Peep(P);
-                }
-              }
-
             }
           }
         }
@@ -88,59 +68,87 @@ struct LLVMFunctionPass
     }
   }
 
-  std::vector<std::function<void(const PeepContext &P)>> Peeps;
 };
-
 
 struct KVOptimizerPass : LLVMFunctionPass<KVOptimizerPass> {
 MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
 
-  //A & B indicates
-  // Op B comes after Op A in the same basic block
-  // They have the same key
-  // There is no intervening write
-  // TODO: Formalize a theory of safe peephole optimizations for this domain
-
-  KVOptimizerPass() {
-    Peeps.push_back([&](auto P) {
-      // get && del => getdel
-
-      // TODO abstract away this iteration and make it pattern based
-      // Can't be a DAG rewrite unfortunately
-
-      for (int i = 0; i < P.Ops.size() - 1 ; ++i) {
-        if (auto Get = dyn_cast<kv::GetOp>(P.Ops[i])) {
-          if (auto Del = dyn_cast<kv::DelOp>(P.Ops[i + 1])) {
-            if (P.Ops[i]->getOperand(1) == P.Ops[i + 1]->getOperand(1)) {
-              OpBuilder B(P.Ops[i]->getContext());
-              B.setInsertionPoint(P.Ops[i]);
-              auto GetDel = B.create<kv::GetDelOp>(P.Ops[i]->getLoc(),
-                                                   P.Ops[i]->getResultTypes(),
-                                                   P.Ops[i]->getOperand(0),
-                                                   P.Ops[i]->getOperand(1));
-              P.Ops[i]->replaceAllUsesWith(GetDel);
-              ToRemove.insert(Get);
-              ToRemove.insert(Del);
-            }
-          }
+  template<typename A, typename B, typename Func, typename... K>
+  void ReplaceFirstWith(Func F, Operation *First, Operation *Second, K ...Keys) {
+    if (auto X = dyn_cast<A>(First)) {
+      if (auto Y = dyn_cast<B>(Second)) {
+        if (((First->getOperand(Keys) == Second->getOperand(Keys)) && ...)) {
+          First->replaceAllUsesWith(F(First, Second));
         }
       }
-
-    });
-
-
-    // Make sure this one goes last.
-    Peeps.push_back([&](auto P) {
-      for (auto &&Op : ToRemove) {
-        // TODO: Check for other uses
-        // Does not mater for now because we check hasOneUse earlier.
-        P.B->getOperations().remove(Op);
-        Op->destroy();
-      }
-      ToRemove.clear();
-    });
+    }
   }
-  std::set<mlir::Operation *> ToRemove;
+
+  template<typename T, typename ...O>
+  std::function<Operation *(Operation *, Operation *)>
+  Create(std::set<Operation *> &ToRemove, OpBuilder &Builder, bool First, O ...OpIds) {
+    // The following line requires C++20 support.
+    // Replace with std::tuple and std::apply if we need to compile with an older compiler
+    if (First) {
+      return [&, ... OpIds = std::forward<O>(OpIds)](auto A, auto B) {
+        ToRemove.insert(A);
+        ToRemove.insert(B);
+        Builder.setInsertionPoint(A);
+        return Builder.create<T>(A->getLoc(), A->getResultTypes(), A->getOperand(OpIds)  ...);
+      };
+    } else {
+      return [&, ... OpIds = std::forward<O>(OpIds)](auto A, auto B) {
+        ToRemove.insert(A);
+        ToRemove.insert(B);
+        Builder.setInsertionPoint(A);
+        return Builder.create<T>(A->getLoc(), A->getResultTypes(), B->getOperand(OpIds)  ...);
+      };
+    }
+  }
+
+  void runOnBasicBlock(mlir::Block &B, SymbolTableCollection *STC) override {
+    std::set<Operation *> ToRemove;
+    std::vector<Operation *> KVOps;
+
+    for (auto &&Instruction : B.getOperations()) {
+      if (Instruction.getDialect() && Instruction.getDialect()->getNamespace() == "kv") {
+        KVOps.push_back(&Instruction);
+      }
+    }
+
+    OpBuilder Builder(B.getParentOp()->getContext());
+
+    if (KVOps.size() == 1) {
+      // Folds here
+    }
+    // A & B indicates:
+    // Op B comes after Op A in the same basic block
+    // They have the same key
+    // There is no intervening write
+    // TODO: Formulate a theory of safe peephole optimizations for this domain
+
+    if (KVOps.size() >= 2) {
+      for (size_t i = 0; i < KVOps.size() - 1 ; ++i) {
+        // The following peepholes are written in the ad-hoc DSL defined by the
+        // methods of this class.
+
+        // get & del => getdel
+        ReplaceFirstWith<kv::GetOp, kv::DelOp>(
+          Create<kv::GetDelOp>(ToRemove, Builder, true , 0, 1), // <- the numbers are operand numbers
+            KVOps[i], KVOps[i + 1], /*Keys=*/ 1);
+
+        // get & set => getset
+        ReplaceFirstWith<kv::GetOp, kv::SetOp>(
+          Create<kv::GetSetOp>(ToRemove, Builder, false, 0, 1, 2),
+            KVOps[i], KVOps[i + 1], /*Keys=*/ 1);
+      }
+    }
+
+    for (auto Op : ToRemove) {
+      B.getOperations().remove(Op);
+      Op->destroy();
+    }
+  }
 };
 
 struct LLVMToKVPass : LLVMFunctionPass<LLVMToKVPass> {
@@ -317,7 +325,7 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
       return "GETDEL ";
     } else if (isa<kv::DelOp>(Op)) {
       return "DEL ";
-    } else if (isa<kv::SetOp>(Op)) {
+    } else if (isa<kv::SetOp>(Op) || isa<kv::GetSetOp>(Op)) {
       return "SET ";
     } else {
       llvm_unreachable("Unimplemented translator");
@@ -328,6 +336,9 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
                    LLVM::LLVMFuncOp FreeF, mlir::MLIRContext *Ctx) {
     mlir::OpBuilder B(Ctx);
     B.setInsertionPoint(Op);
+
+    // TODO Create abstractions for the following logic
+
     if (isa<kv::GetOp>(Op) || isa<kv::GetDelOp>(Op)) {
       mlir::Value Str;
       Str = getGlobalString(Op, KWD(Op) + FMT(Op->getOperand(1)));
@@ -350,6 +361,18 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
       auto BasePtr = Call(B, Op, RedisF, Op->getOperand(0), Str, Op->getOperand(1));
       Call(B, Op, FreeF, BasePtr);
       return true;
+
+    } else if (isa<kv::GetSetOp>(Op)) {
+      mlir::Value Str;
+      Str = getGlobalString(Op, KWD(Op) + FMT(Op->getOperand(1)) + FMT(Op->getOperand(2)) + " GET " );
+      Value BasePtr = Call(B, Op, RedisF, Op->getOperand(0), Str, Op->getOperand(1), Op->getOperand(2));
+
+      auto Ptr = GEP(B, Op, BasePtr, 32);
+      // TODO: The index 32 is for the string result, observe the value for int and branch accordingly.
+      ReplaceUses(B, Op, Ptr);
+      Call(B, Op, FreeF, BasePtr);
+      return true;
+
     }
 
     return false;
@@ -378,7 +401,6 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
         Op->destroy();
       }
     }
-
   }
 
 };

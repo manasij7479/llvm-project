@@ -111,7 +111,7 @@ def GetDelOp : KV_Op<"getdel", []> {
   let results = (outs AnyTypeOf<[I32, LLVM_AnyPointer]>:$res);
 }
 
-def GetSetOp : KV_Op<"getset", [NoSideEffect]> {
+def GetSetOp : KV_Op<"getset", []> {
   let summary = "getset";
   let arguments = (ins LLVM_AnyPointer:$ctx,
                    AnyTypeOf<[I32, LLVM_AnyPointer]>:$key,
