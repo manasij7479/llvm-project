@@ -39,6 +39,11 @@ struct LLVMFunctionPass
     llvm_unreachable("Abstract LLVMFunctionPass getDescription");
   }
 
+  struct PeepContext {
+    mlir::Block *B;
+    std::vector<mlir::Operation *> Ops; // Only relevant operations, not all.
+  };
+
   virtual void runOnFunction(LLVM::LLVMFuncOp &F,
                              SymbolTableCollection *SymTab) {};
   virtual void runOnBasicBlock(mlir::Block &B,
@@ -59,12 +64,23 @@ struct LLVMFunctionPass
             runOnFunction(Function, &STC);
             for (auto &&Block : Function.getRegion()) {
               runOnBasicBlock(Block, &STC);
+              std::vector<mlir::Operation *> KVOps;
               for (auto &&Instruction : Block.getOperations()) {
                 runOnInstruction(Instruction, &STC);
+                if (Instruction.getDialect() && Instruction.getDialect()->getNamespace() == "kv") {
+                  KVOps.push_back(&Instruction);
+                }
               }
-              for (auto &&Peep : Peeps) {
-                Peep(Block);
+              PeepContext P;
+              P.B = &Block;
+              P.Ops = KVOps;
+              if (KVOps.size() >= 2) {
+                // make sure we handle folds separately
+                for (auto &&Peep : Peeps) {
+                  Peep(P);
+                }
               }
+
             }
           }
         }
@@ -72,18 +88,59 @@ struct LLVMFunctionPass
     }
   }
 
-  std::vector<std::function<void(mlir::Block &)>> Peeps;
+  std::vector<std::function<void(const PeepContext &P)>> Peeps;
 };
 
 
 struct KVOptimizerPass : LLVMFunctionPass<KVOptimizerPass> {
 MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
 
+  //A & B indicates
+  // Op B comes after Op A in the same basic block
+  // They have the same key
+  // There is no intervening write
+  // TODO: Formalize a theory of safe peephole optimizations for this domain
+
   KVOptimizerPass() {
-    // Peephole optimizations here
-    Peeps.push_back([](mlir::Block &B) {
+    Peeps.push_back([&](auto P) {
+      // get && del => getdel
+
+      // TODO abstract away this iteration and make it pattern based
+      // Can't be a DAG rewrite unfortunately
+
+      for (int i = 0; i < P.Ops.size() - 1 ; ++i) {
+        if (auto Get = dyn_cast<kv::GetOp>(P.Ops[i])) {
+          if (auto Del = dyn_cast<kv::DelOp>(P.Ops[i + 1])) {
+            if (P.Ops[i]->getOperand(1) == P.Ops[i + 1]->getOperand(1)) {
+              OpBuilder B(P.Ops[i]->getContext());
+              B.setInsertionPoint(P.Ops[i]);
+              auto GetDel = B.create<kv::GetDelOp>(P.Ops[i]->getLoc(),
+                                                   P.Ops[i]->getResultTypes(),
+                                                   P.Ops[i]->getOperand(0),
+                                                   P.Ops[i]->getOperand(1));
+              P.Ops[i]->replaceAllUsesWith(GetDel);
+              ToRemove.insert(Get);
+              ToRemove.insert(Del);
+            }
+          }
+        }
+      }
+
+    });
+
+
+    // Make sure this one goes last.
+    Peeps.push_back([&](auto P) {
+      for (auto &&Op : ToRemove) {
+        // TODO: Check for other uses
+        // Does not mater for now because we check hasOneUse earlier.
+        P.B->getOperations().remove(Op);
+        Op->destroy();
+      }
+      ToRemove.clear();
     });
   }
+  std::set<mlir::Operation *> ToRemove;
 };
 
 struct LLVMToKVPass : LLVMFunctionPass<LLVMToKVPass> {
@@ -252,13 +309,28 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
     }
   }
 
+  std::string KWD(mlir::Operation *Op) {
+    // TODO switch possible?
+    if (isa<kv::GetOp>(Op)) {
+      return "GET ";
+    } else if (isa<kv::GetDelOp>(Op)) {
+      return "GETDEL ";
+    } else if (isa<kv::DelOp>(Op)) {
+      return "DEL ";
+    } else if (isa<kv::SetOp>(Op)) {
+      return "SET ";
+    } else {
+      llvm_unreachable("Unimplemented translator");
+    }
+  }
+
   bool replaceInst(mlir::Operation *Op, LLVM::LLVMFuncOp RedisF,
                    LLVM::LLVMFuncOp FreeF, mlir::MLIRContext *Ctx) {
     mlir::OpBuilder B(Ctx);
     B.setInsertionPoint(Op);
-    if (isa<kv::GetOp>(Op)) {
+    if (isa<kv::GetOp>(Op) || isa<kv::GetDelOp>(Op)) {
       mlir::Value Str;
-      Str = getGlobalString(Op, "GET " + FMT(Op->getOperand(1)));
+      Str = getGlobalString(Op, KWD(Op) + FMT(Op->getOperand(1)));
       Value BasePtr = Call(B, Op, RedisF, Op->getOperand(0), Str, Op->getOperand(1));
 
       auto Ptr = GEP(B, Op, BasePtr, 32);
@@ -268,13 +340,13 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
       return true;
 
     } else if (isa<kv::SetOp>(Op)) {
-      auto Str = getGlobalString(Op, "SET " + FMT(Op->getOperand(1)) + FMT(Op->getOperand(2)));
+      auto Str = getGlobalString(Op, KWD(Op) + FMT(Op->getOperand(1)) + FMT(Op->getOperand(2)));
       auto BasePtr = Call(B, Op, RedisF, Op->getOperand(0), Str, Op->getOperand(1), Op->getOperand(2));
       Call(B, Op, FreeF, BasePtr);
       return true;
 
     } else if (isa<kv::DelOp>(Op)) {
-      auto Str = getGlobalString(Op, "DEL " + FMT(Op->getOperand(1)));
+      auto Str = getGlobalString(Op, KWD(Op) + FMT(Op->getOperand(1)));
       auto BasePtr = Call(B, Op, RedisF, Op->getOperand(0), Str, Op->getOperand(1));
       Call(B, Op, FreeF, BasePtr);
       return true;
