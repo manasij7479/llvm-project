@@ -72,13 +72,36 @@ struct LLVMFunctionPass
 
 struct KVOptimizerPass : LLVMFunctionPass<KVOptimizerPass> {
 MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
+  std::set<Operation *> ToRemove;
 
+  // Optimization DSL definition begin
+
+  // Removes both, replaces First with new operation
   template<typename A, typename B, typename Func, typename... K>
   void ReplaceFirstWith(Func F, Operation *First, Operation *Second, K ...Keys) {
     if (auto X = dyn_cast<A>(First)) {
       if (auto Y = dyn_cast<B>(Second)) {
         if (((First->getOperand(Keys) == Second->getOperand(Keys)) && ...)) {
-          First->replaceAllUsesWith(F(First, Second));
+          ToRemove.insert(First);
+          ToRemove.insert(Second);
+          if (First->getNumResults() != 0) {
+            First->replaceAllUsesWith(F(First, Second));
+          }
+        }
+      }
+    }
+  }
+
+  // Removes First
+  template<typename A, typename B, typename... K>
+  void RedundantFirst(Operation *First, Operation *Second, K ...Keys) {
+    if (auto X = dyn_cast<A>(First)) {
+      if (auto Y = dyn_cast<B>(Second)) {
+        if (((First->getOperand(Keys) == Second->getOperand(Keys)) && ...)) {
+          if (First->getNumResults() != 0) {
+            First->replaceAllUsesWith(Second);
+          }
+          ToRemove.insert(First);
         }
       }
     }
@@ -86,28 +109,25 @@ MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
 
   template<typename T, typename ...O>
   std::function<Operation *(Operation *, Operation *)>
-  Create(std::set<Operation *> &ToRemove, OpBuilder &Builder, bool First, O ...OpIds) {
+  Create(OpBuilder &Builder, bool First, O ...OpIds) {
     // The following line requires C++20 support.
     // Replace with std::tuple and std::apply if we need to compile with an older compiler
     if (First) {
       return [&, ... OpIds = std::forward<O>(OpIds)](auto A, auto B) {
-        ToRemove.insert(A);
-        ToRemove.insert(B);
         Builder.setInsertionPoint(A);
         return Builder.create<T>(A->getLoc(), A->getResultTypes(), A->getOperand(OpIds)  ...);
       };
     } else {
       return [&, ... OpIds = std::forward<O>(OpIds)](auto A, auto B) {
-        ToRemove.insert(A);
-        ToRemove.insert(B);
         Builder.setInsertionPoint(A);
         return Builder.create<T>(A->getLoc(), A->getResultTypes(), B->getOperand(OpIds)  ...);
       };
     }
   }
 
+    // Optimization DSL end
+
   void runOnBasicBlock(mlir::Block &B, SymbolTableCollection *STC) override {
-    std::set<Operation *> ToRemove;
     std::vector<Operation *> KVOps;
 
     for (auto &&Instruction : B.getOperations()) {
@@ -134,20 +154,28 @@ MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
 
         // get & del => getdel
         ReplaceFirstWith<kv::GetOp, kv::DelOp>(
-          Create<kv::GetDelOp>(ToRemove, Builder, true , 0, 1), // <- the numbers are operand numbers
+          Create<kv::GetDelOp>(Builder, true , 0, 1), // <- the numbers are operand numbers
             KVOps[i], KVOps[i + 1], /*Keys=*/ 1);
 
         // get & set => getset
         ReplaceFirstWith<kv::GetOp, kv::SetOp>(
-          Create<kv::GetSetOp>(ToRemove, Builder, false, 0, 1, 2),
+          Create<kv::GetSetOp>(Builder, false, 0, 1, 2),
             KVOps[i], KVOps[i + 1], /*Keys=*/ 1);
+
+        // set_1 & set_2 => set_2
+        RedundantFirst<kv::SetOp, kv::SetOp>(KVOps[i], KVOps[i + 1], 1);
+
+        // get_1 & get_2 => get_2
+        RedundantFirst<kv::GetOp, kv::GetOp>(KVOps[i], KVOps[i + 1], 1);
       }
+
     }
 
     for (auto Op : ToRemove) {
       B.getOperations().remove(Op);
       Op->destroy();
     }
+    ToRemove.clear();
   }
 };
 
