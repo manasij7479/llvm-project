@@ -3,7 +3,7 @@
 
 namespace mlir {
 namespace kv {
-  void registerKVPasses();  
+  void registerKVPasses();
 }
 }
 

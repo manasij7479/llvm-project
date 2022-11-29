@@ -1,3 +1,4 @@
+#include "llvm/Support/CommandLine.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/Dialect/KV/IR/KV.h"
@@ -10,6 +11,22 @@
 #include <unordered_set>
 
 namespace mlir {
+
+struct KVOptions {
+  KVOptions() {
+    SuggestMode = false;
+  }
+  llvm::cl::opt<bool> SuggestMode {
+    "suggest",
+    llvm::cl::desc("Suggest optimizations instead of"
+                   "automatic code generation")};
+};
+
+static llvm::ManagedStatic<KVOptions> Options;
+
+void registerKVPassOptions() {
+  *Options;
+}
 
 #define MLIR_MAGIC_INCANTATIONS(x, cmd, desc)         \
 MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(x)       \
@@ -72,7 +89,27 @@ struct LLVMFunctionPass
 
 struct KVOptimizerPass : LLVMFunctionPass<KVOptimizerPass> {
 MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
+  // Optimization DSL helpers
   std::set<Operation *> ToRemove;
+  void Remove(Operation *Op) {
+    if (Options->SuggestMode) {
+      Op->emitRemark() << "can be removed.";
+    } else {
+      ToRemove.insert(Op);
+    }
+  }
+
+  void Replace(Operation *From, Operation *To) {
+    if (Options->SuggestMode) {
+      std::string data;
+      llvm::raw_string_ostream str(data);
+      To->print(str);
+      From->emitRemark() << "can be replaced with " << data;
+      ToRemove.insert(To);
+    } else {
+      From->replaceAllUsesWith(To);
+    }
+  }
 
   // Optimization DSL definition begin
 
@@ -82,10 +119,10 @@ MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
     if (auto X = dyn_cast<A>(First)) {
       if (auto Y = dyn_cast<B>(Second)) {
         if (((First->getOperand(Keys) == Second->getOperand(Keys)) && ...)) {
-          ToRemove.insert(First);
-          ToRemove.insert(Second);
           if (First->getNumResults() != 0) {
-            First->replaceAllUsesWith(F(First, Second));
+            Remove(First);
+            Remove(Second);
+            Replace(First, F(First, Second));
           }
         }
       }
@@ -99,9 +136,9 @@ MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
       if (auto Y = dyn_cast<B>(Second)) {
         if (((First->getOperand(Keys) == Second->getOperand(Keys)) && ...)) {
           if (First->getNumResults() != 0) {
-            First->replaceAllUsesWith(Second);
+            Replace(First, Second);
           }
-          ToRemove.insert(First);
+          Remove(First);
         }
       }
     }
@@ -437,6 +474,7 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
 
 namespace kv {
 void registerKVPasses() {
+  registerKVPassOptions();
   PassRegistration<LLVMToKVPass>();
   PassRegistration<KVOptimizerPass>();
   PassRegistration<KVToLLVMPass>();
