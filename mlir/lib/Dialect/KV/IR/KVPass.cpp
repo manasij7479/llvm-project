@@ -144,6 +144,27 @@ MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
     }
   }
 
+  void CombineGets(OpBuilder &B, Operation* firstGet, Operation* secondGet) {
+    if(isa<kv::GetOp>(firstGet)&&isa<kv::GetOp>(secondGet)) {
+      B.setInsertionPoint(firstGet);
+      std::vector<Type> res{firstGet->getResultTypes().front(),secondGet->getResultTypes().front()};
+      std::vector<Value> opers{firstGet->getOperand(0),firstGet->getOperand(1),secondGet->getOperand(1)};
+      auto mgetOp=B.create<kv::MGetOp>(secondGet->getLoc(),res,opers);
+      llvm::errs()<<"==============\n";
+      for(auto it=mgetOp.getResults().begin();it!=mgetOp.getResults().end();++it) {
+        (*it).print(llvm::errs());
+        llvm::errs()<<"\n";
+      }
+      std::vector<Value> tmp_res{mgetOp.getResult(0)};
+      firstGet->replaceAllUsesWith(tmp_res);
+      tmp_res.clear();
+      tmp_res.push_back(mgetOp.getResult(1));
+      secondGet->replaceAllUsesWith(tmp_res);
+      Remove(firstGet);
+      Remove(secondGet);
+    }
+  }
+
   template<typename T, typename ...O>
   std::function<Operation *(Operation *, Operation *)>
   Create(OpBuilder &Builder, bool First, O ...OpIds) {
@@ -198,6 +219,11 @@ MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
         ReplaceFirstWith<kv::GetOp, kv::SetOp>(
           Create<kv::GetSetOp>(Builder, false, 0, 1, 2),
             KVOps[i], KVOps[i + 1], /*Keys=*/ 1);
+
+
+        // get1 & get2 => mget
+        // get1 and get2 have to be independent
+        CombineGets(Builder,KVOps[i], KVOps[i+1]);
 
         // set_1 & set_2 => set_2
         RedundantFirst<kv::SetOp, kv::SetOp>(KVOps[i], KVOps[i + 1], 1);
