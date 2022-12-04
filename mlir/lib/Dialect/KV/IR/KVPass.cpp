@@ -4,11 +4,13 @@
 #include "mlir/Dialect/KV/IR/KV.h"
 #include "mlir/Dialect/KV/IR/Pass.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/Pass/Pass.h"
 
 #include "llvm/Support/raw_ostream.h"
 #include <functional>
 #include <unordered_set>
+#include <deque>
 
 namespace mlir {
 
@@ -93,7 +95,7 @@ MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
   std::set<Operation *> ToRemove;
   void Remove(Operation *Op) {
     if (Options->SuggestMode) {
-      Op->emitRemark() << "can be removed.";
+      Op->emitRemark() << "can be removed.\n";
     } else {
       ToRemove.insert(Op);
     }
@@ -104,11 +106,21 @@ MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
       std::string data;
       llvm::raw_string_ostream str(data);
       To->print(str);
-      From->emitRemark() << "can be replaced with " << data;
+      From->emitRemark() << "can be replaced with " << data << "\n";
       ToRemove.insert(To);
     } else {
       From->replaceAllUsesWith(To);
     }
+  }
+
+  bool AllOperandsDominate(Operation *NewOp, Operation *Target) {
+    DominanceInfo D(NewOp);
+    for (auto Op : NewOp->getOperands()) {
+      if (!D.dominates(Op, Target)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   // Optimization DSL definition begin
@@ -120,10 +132,16 @@ MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
       if (auto Y = dyn_cast<B>(Second)) {
         if (((First->getOperand(Keys) == Second->getOperand(Keys)) && ...)) {
           if (First->getNumResults() != 0) {
-            Remove(First);
-            Remove(Second);
-            Replace(First, F(First, Second));
+            auto NewOp = F(First, Second);
+            if (AllOperandsDominate(NewOp, First)) {
+              Remove(First);
+              Remove(Second);
+              Replace(First, NewOp);
+            } else {
+              ToRemove.insert(NewOp);
+            }
           }
+
         }
       }
     }
@@ -183,18 +201,149 @@ MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
     }
   }
 
-    // Optimization DSL end
+  // Optimization DSL end
 
-  void runOnBasicBlock(mlir::Block &B, SymbolTableCollection *STC) override {
+  // Find and fix edge cases
+  // For example: do we want dependencies from other basic blocks at all?
+  // Do we want dependencies which do not dominate Root?
+  // Is that situation even possible?
+  void DFS(Operation *Root, std::vector<Operation*> &Results, size_t MaxDepth) {
+    std::vector<std::pair<Operation *, size_t>> Stack{{Root, 0}};
+    std::set<Operation *> Visited;
+    while (!Stack.empty()) {
+      auto Cur = Stack.back();
+      Stack.pop_back();
+      if (Cur.second >= MaxDepth) {
+        continue;
+      }
+
+      // Cur.first->dump();
+      // llvm::errs() << "\n";
+      // if (isa<LLVM::CallOp>(Cur.first)) {
+      //   continue;
+      // }
+      if (Visited.find(Cur.first) != Visited.end()){
+        continue;
+      } else {
+        Visited.insert(Cur.first);
+      }
+
+      if (Cur.first != Root && Cur.first->getDialect()
+          && Cur.first->getDialect()->getNamespace() == "kv"
+          && Cur.first->hasOneUse()) {
+        Results.push_back(Cur.first);
+      }
+      for (auto Op : Cur.first->getOperands()) {
+        if (Op.getDefiningOp()) {
+          Stack.push_back({Op.getDefiningOp(), Cur.second + 1});
+        }
+      }
+    }
+  }
+
+  // Switch to a more efficient approach if this is a bottleneck
+  // Maybe topological sort and then transitive dependencies.
+  // i.e. if A is a dependency of B and B is a dependency of C, A is a
+  // dependency of C. Just have to compute B before C.
+  std::map<Operation *, std::vector<Operation*>>
+  findDependencies(const std::vector<Operation *> &Ops) {
+    const size_t MaxDepth = 10; // Search depth
+    std::map<Operation *, std::vector<Operation*>> Results;
+    for (const auto &Op : Ops) {
+      std::vector<Operation *> Deps;
+      DFS(Op, Deps, MaxDepth);
+      Results[Op] = Deps;
+    }
+    return Results;
+  }
+
+  // TODO: Also match types
+  Value Follow(Operation *Root, std::deque<size_t> Path) {
+    if (Path.empty()) {
+      return Root->getResult(0); // This might not work for mget and family
+    }
+    if (Root) {
+      auto Cur = Path.front();
+      Path.pop_front();
+      if (Cur < Root->getNumOperands()) {
+        if (Path.empty()) {
+          return Root->getOperand(Cur);
+        } else {
+          return Follow(Root->getOperand(Cur).getDefiningOp(), Path);
+        }
+      } else {
+        return nullptr;
+      }
+    } else {
+      return nullptr;
+    }
+  }
+
+  // Pattern matching DSL? Using existing one?
+  Operation* TryDAGRewrites(Operation *Op, OpBuilder& Builder) {
+    Builder.setInsertionPoint(Op);
+    // set(k, get(k) + N) => incrby(n, N)
+    if (isa<kv::SetOp>(*Op)) {
+      auto Target = Follow(Op, {2, 0, 0, 0, 0});
+      // Enforce types
+      // llvm::errs() << "A\n";
+      if (Target && Target.getDefiningOp() && isa<kv::GetOp>(Target.getDefiningOp())) {
+        // llvm::errs() << "B\n";
+        auto IncrVal = Follow(Op, {2, 1});
+        if (IncrVal) {
+          // llvm::errs() << "C\n";
+          Remove(Follow(Op, {2, 0, 0, 0, 0}).getDefiningOp());
+          Remove(Follow(Op, {2, 0, 0, 0}).getDefiningOp());
+          Remove(Follow(Op, {2, 0, 0}).getDefiningOp());
+          Remove(Follow(Op, {2, 0}).getDefiningOp());
+          Remove(Follow(Op, {2}).getDefiningOp());
+          Remove(Op);
+          return Builder.create<kv::IncrByOp>(Op->getLoc(),
+            Op->getResultTypes(), Op->getOperand(0),
+            Op->getOperand(1), IncrVal);
+        }
+      }
+    }
+    return nullptr;
+  }
+
+  std::vector<Operation *> CommitAndGetKVOps(mlir::Block &B) {
+    int Tries = 5;
+    std::set<Operation *> Removed;
+
+    while (Tries--) {
+      for (auto Op : ToRemove) {
+        if (Removed.find(Op) == Removed.end()) {
+          if (Op->getUses().empty()) {
+            B.getOperations().remove(Op);
+            Op->destroy();
+            Removed.insert(Op);
+          }
+        }
+      }
+    }
+
+    ToRemove.clear();
+
     std::vector<Operation *> KVOps;
-
     for (auto &&Instruction : B.getOperations()) {
       if (Instruction.getDialect() && Instruction.getDialect()->getNamespace() == "kv") {
         KVOps.push_back(&Instruction);
       }
     }
+    return KVOps;
+  }
 
+  void runOnBasicBlock(mlir::Block &B, SymbolTableCollection *STC) override {
+    std::vector<Operation *> KVOps = CommitAndGetKVOps(B);
     OpBuilder Builder(B.getParentOp()->getContext());
+    for (auto &&Op : KVOps) {
+      if (auto Replacement = TryDAGRewrites(Op, Builder)) {
+        Replace(Op, Replacement);
+      }
+    }
+
+    KVOps = CommitAndGetKVOps(B);
 
     if (KVOps.size() == 1) {
       // Folds here
@@ -212,7 +361,7 @@ MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
 
         // get & del => getdel
         ReplaceFirstWith<kv::GetOp, kv::DelOp>(
-          Create<kv::GetDelOp>(Builder, true , 0, 1), // <- the numbers are operand numbers
+          Create<kv::GetDelOp>(Builder, true , /*Operand indices=*/ 0, 1),
             KVOps[i], KVOps[i + 1], /*Keys=*/ 1);
 
         // get & set => getset
@@ -228,17 +377,12 @@ MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
         // set_1 & set_2 => set_2
         RedundantFirst<kv::SetOp, kv::SetOp>(KVOps[i], KVOps[i + 1], 1);
 
-        // get_1 & get_2 => get_2
-        RedundantFirst<kv::GetOp, kv::GetOp>(KVOps[i], KVOps[i + 1], 1);
+        // // get_1 & get_2 => get_1
+        // RedundantSecond<kv::GetOp, kv::GetOp>(KVOps[i], KVOps[i + 1], 1);
       }
 
     }
-
-    for (auto Op : ToRemove) {
-      B.getOperations().remove(Op);
-      Op->destroy();
-    }
-    ToRemove.clear();
+    CommitAndGetKVOps(B);
   }
 };
 
