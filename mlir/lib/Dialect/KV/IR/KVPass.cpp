@@ -502,6 +502,7 @@ MLIR_MAGIC_INCANTATIONS(LLVMToKVPass, "llvm-to-kv", "LLVM to KV")
     if (Args.empty()) {
       return false; // Likely not a KV operation
     }
+
     auto Prefix = Args[0];
 
     std::vector<Value> Operands;
@@ -517,7 +518,7 @@ MLIR_MAGIC_INCANTATIONS(LLVMToKVPass, "llvm-to-kv", "LLVM to KV")
 
     auto OPN = [&](size_t i) { return Operands[i];};
 
-    std::unordered_set<std::string> Supported{"GET", "SET", "DEL"};
+    std::unordered_set<std::string> Supported{"GET", "SET", "DEL", "HGET", "HSET"};
 
     if (Supported.find(Prefix) == Supported.end()) {
       llvm::errs() << "Unsupported KV OP: " << Prefix << "\n";
@@ -536,8 +537,13 @@ MLIR_MAGIC_INCANTATIONS(LLVMToKVPass, "llvm-to-kv", "LLVM to KV")
                                         OPN(0), OPN(1));
     } else if (Prefix == "SET") {
       B.createOrFold<kv::SetOp>(Op.getLoc(), OPN(0), OPN(1), OPN(2));
+    } else if (Prefix == "HSET") {
+      B.createOrFold<kv::HSetOp>(Op.getLoc(), OPN(0), OPN(1), OPN(2), OPN(3));
     } else if (Prefix == "DEL") {
       B.createOrFold<kv::DelOp>(Op.getLoc(), OPN(0), OPN(1));
+    } else if (Prefix == "HGET") {
+      Val = B.createOrFold<kv::HGetOp>(Op.getLoc(), Op.getResultTypes(),
+                                       OPN(0), OPN(1), OPN(2));
     } else {
       llvm_unreachable("Unknown prefix.");
     }
@@ -548,7 +554,7 @@ MLIR_MAGIC_INCANTATIONS(LLVMToKVPass, "llvm-to-kv", "LLVM to KV")
         U->erase();
       }
       if (isa<LLVM::GEPOp>(U)) {
-        if (Prefix == "GET") {
+        if (Prefix == "GET" || Prefix == "HGET") {
           // This path has to include all operations which return values.
           U->replaceAllUsesWith(Val.getDefiningOp());
           U->erase();
@@ -622,12 +628,16 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
     // TODO switch possible?
     if (isa<kv::GetOp>(Op)) {
       return "GET ";
+    } else if (isa<kv::HGetOp>(Op)) {
+      return "HGET ";
     } else if (isa<kv::GetDelOp>(Op)) {
       return "GETDEL ";
     } else if (isa<kv::DelOp>(Op)) {
       return "DEL ";
     } else if (isa<kv::SetOp>(Op) || isa<kv::GetSetOp>(Op)) {
       return "SET ";
+    } else if (isa<kv::HSetOp>(Op)) {
+      return "HSET ";
     } else if (isa<kv::IncrByOp>(Op)) {
       return "INCRBY ";
     } else {
