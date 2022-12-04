@@ -4,11 +4,13 @@
 #include "mlir/Dialect/KV/IR/KV.h"
 #include "mlir/Dialect/KV/IR/Pass.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/Pass/Pass.h"
 
 #include "llvm/Support/raw_ostream.h"
 #include <functional>
 #include <unordered_set>
+#include <deque>
 
 namespace mlir {
 
@@ -43,6 +45,16 @@ MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(x)       \
     DialectRegistry &registry) const override {       \
     registry.insert<mlir::kv::KVDialect>();           \
   }
+
+mlir::Value getGlobalString(mlir::Operation *Root, StringRef Str) {
+  mlir::OpBuilder B(Root->getContext());
+  static int StrNum = 0;
+  auto Name = "s" + std::to_string(StrNum++);
+  SmallString<16> NullTerminatedStr(Str);
+  NullTerminatedStr.push_back('\0');
+  B.setInsertionPoint(Root);
+  return LLVM::createGlobalString(Root->getLoc(), B, Name, NullTerminatedStr, LLVM::linkage::Linkage::Internal);
+}
 
 template <typename CustomPass>
 struct LLVMFunctionPass
@@ -93,7 +105,7 @@ MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
   std::set<Operation *> ToRemove;
   void Remove(Operation *Op) {
     if (Options->SuggestMode) {
-      Op->emitRemark() << "can be removed.";
+      Op->emitRemark() << "can be removed.\n";
     } else {
       ToRemove.insert(Op);
     }
@@ -104,11 +116,21 @@ MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
       std::string data;
       llvm::raw_string_ostream str(data);
       To->print(str);
-      From->emitRemark() << "can be replaced with " << data;
+      From->emitRemark() << "can be replaced with " << data << "\n";
       ToRemove.insert(To);
     } else {
       From->replaceAllUsesWith(To);
     }
+  }
+
+  bool AllOperandsDominate(Operation *NewOp, Operation *Target) {
+    DominanceInfo D(NewOp);
+    for (auto Op : NewOp->getOperands()) {
+      if (!D.dominates(Op, Target)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   // Optimization DSL definition begin
@@ -120,10 +142,16 @@ MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
       if (auto Y = dyn_cast<B>(Second)) {
         if (((First->getOperand(Keys) == Second->getOperand(Keys)) && ...)) {
           if (First->getNumResults() != 0) {
-            Remove(First);
-            Remove(Second);
-            Replace(First, F(First, Second));
+            auto NewOp = F(First, Second);
+            if (AllOperandsDominate(NewOp, First)) {
+              Remove(First);
+              Remove(Second);
+              Replace(First, NewOp);
+            } else {
+              ToRemove.insert(NewOp);
+            }
           }
+
         }
       }
     }
@@ -178,18 +206,191 @@ MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
     }
   }
 
-    // Optimization DSL end
+  // Optimization DSL end
 
-  void runOnBasicBlock(mlir::Block &B, SymbolTableCollection *STC) override {
+  // Find and fix edge cases
+  // For example: do we want dependencies from other basic blocks at all?
+  // Do we want dependencies which do not dominate Root?
+  // Is that situation even possible?
+  void DFS(Operation *Root, std::vector<Operation*> &Results, size_t MaxDepth) {
+    std::vector<std::pair<Operation *, size_t>> Stack{{Root, 0}};
+    std::set<Operation *> Visited;
+    while (!Stack.empty()) {
+      auto Cur = Stack.back();
+      Stack.pop_back();
+      if (Cur.second >= MaxDepth) {
+        continue;
+      }
+
+      // Cur.first->dump();
+      // llvm::errs() << "\n";
+      // if (isa<LLVM::CallOp>(Cur.first)) {
+      //   continue;
+      // }
+      if (Visited.find(Cur.first) != Visited.end()){
+        continue;
+      } else {
+        Visited.insert(Cur.first);
+      }
+
+      if (Cur.first != Root && Cur.first->getDialect()
+          && Cur.first->getDialect()->getNamespace() == "kv"
+          && Cur.first->hasOneUse()) {
+        Results.push_back(Cur.first);
+      }
+      for (auto Op : Cur.first->getOperands()) {
+        if (Op.getDefiningOp()) {
+          Stack.push_back({Op.getDefiningOp(), Cur.second + 1});
+        }
+      }
+    }
+  }
+
+  // Switch to a more efficient approach if this is a bottleneck
+  // Maybe topological sort and then transitive dependencies.
+  // i.e. if A is a dependency of B and B is a dependency of C, A is a
+  // dependency of C. Just have to compute B before C.
+  std::map<Operation *, std::vector<Operation*>>
+  findDependencies(const std::vector<Operation *> &Ops) {
+    const size_t MaxDepth = 10; // Search depth
+    std::map<Operation *, std::vector<Operation*>> Results;
+    for (const auto &Op : Ops) {
+      std::vector<Operation *> Deps;
+      DFS(Op, Deps, MaxDepth);
+      Results[Op] = Deps;
+    }
+    return Results;
+  }
+
+  // TODO: Also match types
+  Value Follow(Operation *Root, std::deque<size_t> Path) {
+    if (Path.empty()) {
+      return Root->getResult(0); // This might not work for mget and family
+    }
+    if (Root) {
+      auto Cur = Path.front();
+      Path.pop_front();
+      if (Cur < Root->getNumOperands()) {
+        auto Val = Root->getOperand(Cur);
+        if (Path.empty()) {
+          return Val;
+        } else {
+          return Follow(Val.getDefiningOp(), Path);
+        }
+      } else {
+        return nullptr;
+      }
+    } else {
+      return nullptr;
+    }
+  }
+  void Remove(Operation *Root, std::deque<size_t> Path) {
+    if (Path.empty()) {
+      return Remove(Root);
+    }
+    if (Root) {
+      auto Cur = Path.front();
+      Path.pop_front();
+      if (Cur < Root->getNumOperands()) {
+        auto Val = Root->getOperand(Cur);
+        if (auto O = Val.getDefiningOp()) {
+          Remove(O);
+          return Remove(O, Path);
+        }
+      }
+    }
+  }
+
+  Value Search(Operation *Root, std::deque<std::pair<std::string, size_t>> Path) {
+    if (Path.empty()) {
+      return Root->getResult(0); // This might not work for mget and family
+    }
+    if (Root) {
+      auto Cur = Path.front();
+      Path.pop_front();
+      if (Cur.second < Root->getNumOperands()) {
+        auto Val = Root->getOperand(Cur.second);
+        if (Cur.first != "") {
+          if (Val.getDefiningOp()) {
+            if (Val.getDefiningOp()->getName().getStringRef() != Cur.first) {
+              return nullptr;
+            }
+          } else {
+            return nullptr;
+          }
+        }
+        if (Path.empty()) {
+          return Val;
+        } else {
+          return Search(Val.getDefiningOp(), Path);
+        }
+      } else {
+        return nullptr;
+      }
+    } else {
+      return nullptr;
+    }
+  }
+
+
+  // Pattern matching DSL? Using existing one?
+  Operation* TryDAGRewrites(Operation *Op, OpBuilder& Builder) {
+    Builder.setInsertionPoint(Op);
+    // set(k, get(k) + N) => incrby(n, N)
+    if (isa<kv::SetOp>(*Op)) {
+      auto Target = Search(Op, {{"llvm.add", 2}, {"llvm.call", 0},
+                                {"llvm.load", 0}, {"llvm.bitcast", 0},
+                                {"kv.get", 0}});
+      if (Target) {
+        auto IncrVal = Follow(Op, {2, 1});
+        if (IncrVal) {
+          Remove(Op);
+          Remove(Op, {2, 0, 0, 0, 0});
+          return Builder.create<kv::IncrByOp>(Op->getLoc(), Op->getResultTypes(),
+            Op->getOperand(0), Op->getOperand(1), IncrVal);
+        }
+      }
+    }
+    return nullptr;
+  }
+
+  std::vector<Operation *> CommitAndGetKVOps(mlir::Block &B) {
+    int Tries = 5;
+    std::set<Operation *> Removed;
+
+    while (Tries--) {
+      for (auto Op : ToRemove) {
+        if (Removed.find(Op) == Removed.end()) {
+          if (Op->getUses().empty()) {
+            B.getOperations().remove(Op);
+            Op->destroy();
+            Removed.insert(Op);
+          }
+        }
+      }
+    }
+
+    ToRemove.clear();
+
     std::vector<Operation *> KVOps;
-
     for (auto &&Instruction : B.getOperations()) {
       if (Instruction.getDialect() && Instruction.getDialect()->getNamespace() == "kv") {
         KVOps.push_back(&Instruction);
       }
     }
+    return KVOps;
+  }
 
+  void runOnBasicBlock(mlir::Block &B, SymbolTableCollection *STC) override {
+    std::vector<Operation *> KVOps = CommitAndGetKVOps(B);
     OpBuilder Builder(B.getParentOp()->getContext());
+    for (auto &&Op : KVOps) {
+      if (auto Replacement = TryDAGRewrites(Op, Builder)) {
+        Replace(Op, Replacement);
+      }
+    }
+
+    KVOps = CommitAndGetKVOps(B);
 
     if (KVOps.size() == 1) {
       // Folds here
@@ -207,7 +408,7 @@ MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
 
         // get & del => getdel
         ReplaceFirstWith<kv::GetOp, kv::DelOp>(
-          Create<kv::GetDelOp>(Builder, true , 0, 1), // <- the numbers are operand numbers
+          Create<kv::GetDelOp>(Builder, true , /*Operand indices=*/ 0, 1),
             KVOps[i], KVOps[i + 1], /*Keys=*/ 1);
 
         // get & set => getset
@@ -223,17 +424,12 @@ MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
         // set_1 & set_2 => set_2
         RedundantFirst<kv::SetOp, kv::SetOp>(KVOps[i], KVOps[i + 1], 1);
 
-        // get_1 & get_2 => get_2
-        RedundantFirst<kv::GetOp, kv::GetOp>(KVOps[i], KVOps[i + 1], 1);
+        // // get_1 & get_2 => get_1
+        // RedundantSecond<kv::GetOp, kv::GetOp>(KVOps[i], KVOps[i + 1], 1);
       }
 
     }
-
-    for (auto Op : ToRemove) {
-      B.getOperations().remove(Op);
-      Op->destroy();
-    }
-    ToRemove.clear();
+    CommitAndGetKVOps(B);
   }
 };
 
@@ -245,8 +441,17 @@ MLIR_MAGIC_INCANTATIONS(LLVMToKVPass, "llvm-to-kv", "LLVM to KV")
     // llvm::errs() << F.getName() << "<-FUNCNAME\n";
   }
 
+  std::vector<std::string> split(std::string str) {
+    std::vector<std::string> Results;
+    std::istringstream in(str);
+    std::string word;
+    while (in >> word) {
+      Results.push_back(word);
+    }
+    return Results;
+  }
   // TODO: Figure out if there is a more idiomatic way to do this matching
-  std::optional<std::string> getKVPrefix(mlir::Operation &Op,
+  std::vector<std::string> getKVPrefix(mlir::Operation &Op,
                                              SymbolTableCollection *SymTab) {
     if (!isa_and_nonnull<LLVM::CallOp>(Op) || Op.getNumOperands() <= 1) {
       return {};
@@ -276,20 +481,39 @@ MLIR_MAGIC_INCANTATIONS(LLVMToKVPass, "llvm-to-kv", "LLVM to KV")
     std::string FullStr;
     llvm::raw_string_ostream s(FullStr);
     s << Global.getValue().value();
-    return FullStr.substr(1, FullStr.find(' ') - 1);
+
+    std::vector<std::string> Results;
+    for (auto &&Word : split(FullStr.substr(1, FullStr.length() - 2))) {
+      Results.push_back(Word);
+    }
+
+    return Results;
   }
 
   bool replaceInst(mlir::Operation &Op,
                        SymbolTableCollection *SymTab){
     // Op.dump();
-    auto Prefix_p = getKVPrefix(Op, SymTab);
-    if (!Prefix_p.has_value()) {
+    auto Args = getKVPrefix(Op, SymTab);
+    if (Args.empty()) {
       return false; // Likely not a KV operation
     }
-    auto Prefix = Prefix_p.value();
 
+    auto Prefix = Args[0];
 
-    std::unordered_set<std::string> Supported{"GET", "SET", "DEL"};
+    std::vector<Value> Operands;
+    Operands.push_back(Op.getOperand(0));
+    size_t NextOpnIdx = 0;
+    for (size_t i = 1; i < Args.size(); ++i) {
+      if (Args[i][0] == '%') {
+        Operands.push_back(Op.getOperand(2 + NextOpnIdx++));
+      } else {
+        Operands.push_back(getGlobalString(&Op, Args[i]));
+      }
+    }
+
+    auto OPN = [&](size_t i) { return Operands[i];};
+
+    std::unordered_set<std::string> Supported{"GET", "SET", "DEL", "HGET", "HSET"};
 
     if (Supported.find(Prefix) == Supported.end()) {
       llvm::errs() << "Unsupported KV OP: " << Prefix << "\n";
@@ -305,14 +529,16 @@ MLIR_MAGIC_INCANTATIONS(LLVMToKVPass, "llvm-to-kv", "LLVM to KV")
     B.setInsertionPoint(&Op);
     if (Prefix == "GET") {
       Val = B.createOrFold<kv::GetOp>(Op.getLoc(), Op.getResultTypes(),
-                                        Op.getOperand(0), Op.getOperand(2));
+                                        OPN(0), OPN(1));
     } else if (Prefix == "SET") {
-      B.createOrFold<kv::SetOp>(Op.getLoc(),
-                                Op.getOperand(0), Op.getOperand(2),
-                                Op.getOperand(3));
+      B.createOrFold<kv::SetOp>(Op.getLoc(), OPN(0), OPN(1), OPN(2));
+    } else if (Prefix == "HSET") {
+      B.createOrFold<kv::HSetOp>(Op.getLoc(), OPN(0), OPN(1), OPN(2), OPN(3));
     } else if (Prefix == "DEL") {
-      B.createOrFold<kv::DelOp>(Op.getLoc(),
-                                Op.getOperand(0), Op.getOperand(2));
+      B.createOrFold<kv::DelOp>(Op.getLoc(), OPN(0), OPN(1));
+    } else if (Prefix == "HGET") {
+      Val = B.createOrFold<kv::HGetOp>(Op.getLoc(), Op.getResultTypes(),
+                                       OPN(0), OPN(1), OPN(2));
     } else {
       llvm_unreachable("Unknown prefix.");
     }
@@ -323,7 +549,7 @@ MLIR_MAGIC_INCANTATIONS(LLVMToKVPass, "llvm-to-kv", "LLVM to KV")
         U->erase();
       }
       if (isa<LLVM::GEPOp>(U)) {
-        if (Prefix == "GET") {
+        if (Prefix == "GET" || Prefix == "HGET") {
           // This path has to include all operations which return values.
           U->replaceAllUsesWith(Val.getDefiningOp());
           U->erase();
@@ -351,16 +577,6 @@ MLIR_MAGIC_INCANTATIONS(LLVMToKVPass, "llvm-to-kv", "LLVM to KV")
 
 struct KVToLLVMPass : LLVMFunctionPass<KVToLLVMPass> {
 MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
-
-  mlir::Value getGlobalString(mlir::Operation *Root, StringRef Str) {
-    mlir::OpBuilder B(Root->getContext());
-    static int StrNum = 0;
-    auto Name = "s" + std::to_string(StrNum++);
-    SmallString<16> NullTerminatedStr(Str);
-    NullTerminatedStr.push_back('\0');
-    B.setInsertionPoint(Root);
-    return LLVM::createGlobalString(Root->getLoc(), B, Name, NullTerminatedStr, LLVM::linkage::Linkage::Internal);
-  }
 
   template <typename ...Args>
   Value Call(mlir::OpBuilder B, mlir::Operation *Root, LLVM::LLVMFuncOp F, Args... args) {
@@ -408,6 +624,8 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
     // TODO switch possible?
     if (isa<kv::GetOp>(Op)) {
       return "GET ";
+    } else if (isa<kv::HGetOp>(Op)) {
+      return "HGET ";
     } else if (isa<kv::GetDelOp>(Op)) {
       return "GETDEL ";
     } else if (isa<kv::DelOp>(Op)) {
@@ -416,8 +634,12 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
       return "SET ";
     } else if(isa<kv::MGetOp>(Op)){
         return "MGET ";
-    }
-    else {
+    }else if (isa<kv::HSetOp>(Op)) {
+      return "HSET ";
+    } else if (isa<kv::IncrByOp>(Op)) {
+      return "INCRBY ";
+    } else {
+
       llvm_unreachable("Unimplemented translator");
     }
   }
@@ -462,6 +684,12 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
       return true;
     }
     else if (isa<kv::SetOp>(Op)) {
+      auto Str = getGlobalString(Op, KWD(Op) + FMT(Op->getOperand(1)) + FMT(Op->getOperand(2)));
+      auto BasePtr = Call(B, Op, RedisF, Op->getOperand(0), Str, Op->getOperand(1), Op->getOperand(2));
+      Call(B, Op, FreeF, BasePtr);
+      return true;
+
+    } else if (isa<kv::IncrByOp>(Op)) {
       auto Str = getGlobalString(Op, KWD(Op) + FMT(Op->getOperand(1)) + FMT(Op->getOperand(2)));
       auto BasePtr = Call(B, Op, RedisF, Op->getOperand(0), Str, Op->getOperand(1), Op->getOperand(2));
       Call(B, Op, FreeF, BasePtr);

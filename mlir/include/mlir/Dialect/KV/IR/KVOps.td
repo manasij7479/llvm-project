@@ -52,8 +52,8 @@ def GetOp : KV_Op<"get", [NoSideEffect]> {
 def HGetOp : KV_Op<"hget", [NoSideEffect]> {
   let summary = "hget";
   let arguments = (ins LLVM_AnyPointer:$ctx,
-                   AnyTypeOf<[I32, LLVM_AnyPointer]>:$tab,
-                   AnyTypeOf<[I32, LLVM_AnyPointer]>:$key);
+                   AnyTypeOf<[I32, LLVM_AnyPointer]>:$key,
+                   AnyTypeOf<[I32, LLVM_AnyPointer]>:$field);
   let results = (outs AnyTypeOf<[I32, LLVM_AnyPointer]>:$res);
 }
 
@@ -67,8 +67,8 @@ def MGetOp : KV_Op<"mget", [NoSideEffect]> {
 def HMGetOp : KV_Op<"hmget", [NoSideEffect]> {
   let summary = "hmget";
   let arguments = (ins LLVM_AnyPointer:$ctx,
-                   AnyTypeOf<[I32, LLVM_AnyPointer]>:$tab,
-                   Variadic<AnyTypeOf<[I32, LLVM_AnyPointer]>>:$keys);
+                   AnyTypeOf<[I32, LLVM_AnyPointer]>:$key,
+                   Variadic<AnyTypeOf<[I32, LLVM_AnyPointer]>>:$fields);
   let results = (outs Variadic<AnyTypeOf<[I32, LLVM_AnyPointer]>>:$results);
 }
 
@@ -83,8 +83,8 @@ def SetOp : KV_Op<"set", []> {
 def HSetOp : KV_Op<"hset", []> {
   let summary = "hset";
   let arguments = (ins LLVM_AnyPointer:$ctx,
-                   AnyTypeOf<[I32, LLVM_AnyPointer]>:$tab,
                    AnyTypeOf<[I32, LLVM_AnyPointer]>:$key,
+                   AnyTypeOf<[I32, LLVM_AnyPointer]>:$field,
                    AnyTypeOf<[I32, LLVM_AnyPointer]>:$value);
   let hasCanonicalizer = 1;
 }
@@ -99,8 +99,8 @@ def MSetOp : KV_Op<"mset", [SameVariadicOperandSize]> {
 def HMSetOp : KV_Op<"hmset", [SameVariadicOperandSize]> {
   let summary = "hmset";
   let arguments = (ins LLVM_AnyPointer:$ctx,
-                   AnyTypeOf<[I32, LLVM_AnyPointer]>:$tab,
-                   Variadic<AnyTypeOf<[I32, LLVM_AnyPointer]>>:$keys,
+                   AnyTypeOf<[I32, LLVM_AnyPointer]>:$key,
+                   Variadic<AnyTypeOf<[I32, LLVM_AnyPointer]>>:$fields,
                    Variadic<AnyTypeOf<[I32, LLVM_AnyPointer]>>:$values);
 }
 
@@ -125,6 +125,14 @@ def DelOp : KV_Op<"del", []> {
                    AnyTypeOf<[I32, LLVM_AnyPointer]>:$key);
 }
 
+def HDelOp : KV_Op<"hdel", []> {
+  let summary = "hdel";
+  let arguments = (ins LLVM_AnyPointer:$ctx,
+                   AnyTypeOf<[I32, LLVM_AnyPointer]>:$key,
+                   AnyTypeOf<[I32, LLVM_AnyPointer]>:$field);
+}
+
+
 def IncrByOp : KV_Op<"incrby", []> {
   let summary = "incrby";
   let arguments = (ins LLVM_AnyPointer:$ctx,
@@ -146,6 +154,16 @@ def ExistsOp : KV_Op<"exists", []> {
                        AnyTypeOf<[I32, LLVM_AnyPointer]>:$key);
   let results = (outs I32);
 }
+
+def EvalOp : KV_Op<"eval", []> {
+  let summary = "Server side script eval";
+  let arguments = (ins StrAttr:$script,
+                       LLVM_AnyPointer:$ctx,
+                       Variadic<AnyTypeOf<[I32, LLVM_AnyPointer]>>:$inputs);
+  let results = (outs Variadic<AnyTypeOf<[I32, LLVM_AnyPointer]>>:$results);
+}
+
+// TODO Opaque operation when we fail to parse the inputs
 
 // TODO Add operations which require loop matching
 
