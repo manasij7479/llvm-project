@@ -46,6 +46,16 @@ MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(x)       \
     registry.insert<mlir::kv::KVDialect>();           \
   }
 
+mlir::Value getGlobalString(mlir::Operation *Root, StringRef Str) {
+  mlir::OpBuilder B(Root->getContext());
+  static int StrNum = 0;
+  auto Name = "s" + std::to_string(StrNum++);
+  SmallString<16> NullTerminatedStr(Str);
+  NullTerminatedStr.push_back('\0');
+  B.setInsertionPoint(Root);
+  return LLVM::createGlobalString(Root->getLoc(), B, Name, NullTerminatedStr, LLVM::linkage::Linkage::Internal);
+}
+
 template <typename CustomPass>
 struct LLVMFunctionPass
   : public PassWrapper<CustomPass,
@@ -436,8 +446,17 @@ MLIR_MAGIC_INCANTATIONS(LLVMToKVPass, "llvm-to-kv", "LLVM to KV")
     // llvm::errs() << F.getName() << "<-FUNCNAME\n";
   }
 
+  std::vector<std::string> split(std::string str) {
+    std::vector<std::string> Results;
+    std::istringstream in(str);
+    std::string word;
+    while (in >> word) {
+      Results.push_back(word);
+    }
+    return Results;
+  }
   // TODO: Figure out if there is a more idiomatic way to do this matching
-  std::optional<std::string> getKVPrefix(mlir::Operation &Op,
+  std::vector<std::string> getKVPrefix(mlir::Operation &Op,
                                              SymbolTableCollection *SymTab) {
     if (!isa_and_nonnull<LLVM::CallOp>(Op) || Op.getNumOperands() <= 1) {
       return {};
@@ -467,18 +486,36 @@ MLIR_MAGIC_INCANTATIONS(LLVMToKVPass, "llvm-to-kv", "LLVM to KV")
     std::string FullStr;
     llvm::raw_string_ostream s(FullStr);
     s << Global.getValue().value();
-    return FullStr.substr(1, FullStr.find(' ') - 1);
+
+    std::vector<std::string> Results;
+    for (auto &&Word : split(FullStr.substr(1, FullStr.length() - 2))) {
+      Results.push_back(Word);
+    }
+
+    return Results;
   }
 
   bool replaceInst(mlir::Operation &Op,
                        SymbolTableCollection *SymTab){
     // Op.dump();
-    auto Prefix_p = getKVPrefix(Op, SymTab);
-    if (!Prefix_p.has_value()) {
+    auto Args = getKVPrefix(Op, SymTab);
+    if (Args.empty()) {
       return false; // Likely not a KV operation
     }
-    auto Prefix = Prefix_p.value();
+    auto Prefix = Args[0];
 
+    std::vector<Value> Operands;
+    Operands.push_back(Op.getOperand(0));
+    size_t NextOpnIdx = 0;
+    for (size_t i = 1; i < Args.size(); ++i) {
+      if (Args[i][0] == '%') {
+        Operands.push_back(Op.getOperand(2 + NextOpnIdx++));
+      } else {
+        Operands.push_back(getGlobalString(&Op, Args[i]));
+      }
+    }
+
+    auto OPN = [&](size_t i) { return Operands[i];};
 
     std::unordered_set<std::string> Supported{"GET", "SET", "DEL"};
 
@@ -496,14 +533,11 @@ MLIR_MAGIC_INCANTATIONS(LLVMToKVPass, "llvm-to-kv", "LLVM to KV")
     B.setInsertionPoint(&Op);
     if (Prefix == "GET") {
       Val = B.createOrFold<kv::GetOp>(Op.getLoc(), Op.getResultTypes(),
-                                        Op.getOperand(0), Op.getOperand(2));
+                                        OPN(0), OPN(1));
     } else if (Prefix == "SET") {
-      B.createOrFold<kv::SetOp>(Op.getLoc(),
-                                Op.getOperand(0), Op.getOperand(2),
-                                Op.getOperand(3));
+      B.createOrFold<kv::SetOp>(Op.getLoc(), OPN(0), OPN(1), OPN(2));
     } else if (Prefix == "DEL") {
-      B.createOrFold<kv::DelOp>(Op.getLoc(),
-                                Op.getOperand(0), Op.getOperand(2));
+      B.createOrFold<kv::DelOp>(Op.getLoc(), OPN(0), OPN(1));
     } else {
       llvm_unreachable("Unknown prefix.");
     }
@@ -542,16 +576,6 @@ MLIR_MAGIC_INCANTATIONS(LLVMToKVPass, "llvm-to-kv", "LLVM to KV")
 
 struct KVToLLVMPass : LLVMFunctionPass<KVToLLVMPass> {
 MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
-
-  mlir::Value getGlobalString(mlir::Operation *Root, StringRef Str) {
-    mlir::OpBuilder B(Root->getContext());
-    static int StrNum = 0;
-    auto Name = "s" + std::to_string(StrNum++);
-    SmallString<16> NullTerminatedStr(Str);
-    NullTerminatedStr.push_back('\0');
-    B.setInsertionPoint(Root);
-    return LLVM::createGlobalString(Root->getLoc(), B, Name, NullTerminatedStr, LLVM::linkage::Linkage::Internal);
-  }
 
   template <typename ...Args>
   Value Call(mlir::OpBuilder B, mlir::Operation *Root, LLVM::LLVMFuncOp F, Args... args) {
