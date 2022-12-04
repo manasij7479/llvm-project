@@ -266,10 +266,58 @@ MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
       auto Cur = Path.front();
       Path.pop_front();
       if (Cur < Root->getNumOperands()) {
+        auto Val = Root->getOperand(Cur);
         if (Path.empty()) {
-          return Root->getOperand(Cur);
+          return Val;
         } else {
-          return Follow(Root->getOperand(Cur).getDefiningOp(), Path);
+          return Follow(Val.getDefiningOp(), Path);
+        }
+      } else {
+        return nullptr;
+      }
+    } else {
+      return nullptr;
+    }
+  }
+  void Remove(Operation *Root, std::deque<size_t> Path) {
+    if (Path.empty()) {
+      return Remove(Root);
+    }
+    if (Root) {
+      auto Cur = Path.front();
+      Path.pop_front();
+      if (Cur < Root->getNumOperands()) {
+        auto Val = Root->getOperand(Cur);
+        if (auto O = Val.getDefiningOp()) {
+          Remove(O);
+          return Remove(O, Path);
+        }
+      }
+    }
+  }
+
+  Value Search(Operation *Root, std::deque<std::pair<std::string, size_t>> Path) {
+    if (Path.empty()) {
+      return Root->getResult(0); // This might not work for mget and family
+    }
+    if (Root) {
+      auto Cur = Path.front();
+      Path.pop_front();
+      if (Cur.second < Root->getNumOperands()) {
+        auto Val = Root->getOperand(Cur.second);
+        if (Cur.first != "") {
+          if (Val.getDefiningOp()) {
+            if (Val.getDefiningOp()->getName().getStringRef() != Cur.first) {
+              return nullptr;
+            }
+          } else {
+            return nullptr;
+          }
+        }
+        if (Path.empty()) {
+          return Val;
+        } else {
+          return Search(Val.getDefiningOp(), Path);
         }
       } else {
         return nullptr;
@@ -279,28 +327,22 @@ MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
     }
   }
 
+
   // Pattern matching DSL? Using existing one?
   Operation* TryDAGRewrites(Operation *Op, OpBuilder& Builder) {
     Builder.setInsertionPoint(Op);
     // set(k, get(k) + N) => incrby(n, N)
     if (isa<kv::SetOp>(*Op)) {
-      auto Target = Follow(Op, {2, 0, 0, 0, 0});
-      // Enforce types
-      // llvm::errs() << "A\n";
-      if (Target && Target.getDefiningOp() && isa<kv::GetOp>(Target.getDefiningOp())) {
-        // llvm::errs() << "B\n";
+      auto Target = Search(Op, {{"llvm.add", 2}, {"llvm.call", 0},
+                                {"llvm.load", 0}, {"llvm.bitcast", 0},
+                                {"kv.get", 0}});
+      if (Target) {
         auto IncrVal = Follow(Op, {2, 1});
         if (IncrVal) {
-          // llvm::errs() << "C\n";
-          Remove(Follow(Op, {2, 0, 0, 0, 0}).getDefiningOp());
-          Remove(Follow(Op, {2, 0, 0, 0}).getDefiningOp());
-          Remove(Follow(Op, {2, 0, 0}).getDefiningOp());
-          Remove(Follow(Op, {2, 0}).getDefiningOp());
-          Remove(Follow(Op, {2}).getDefiningOp());
           Remove(Op);
-          return Builder.create<kv::IncrByOp>(Op->getLoc(),
-            Op->getResultTypes(), Op->getOperand(0),
-            Op->getOperand(1), IncrVal);
+          Remove(Op, {2, 0, 0, 0, 0});
+          return Builder.create<kv::IncrByOp>(Op->getLoc(), Op->getResultTypes(),
+            Op->getOperand(0), Op->getOperand(1), IncrVal);
         }
       }
     }
@@ -562,6 +604,8 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
       return "DEL ";
     } else if (isa<kv::SetOp>(Op) || isa<kv::GetSetOp>(Op)) {
       return "SET ";
+    } else if (isa<kv::IncrByOp>(Op)) {
+      return "INCRBY ";
     } else {
       llvm_unreachable("Unimplemented translator");
     }
@@ -586,6 +630,12 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
       return true;
 
     } else if (isa<kv::SetOp>(Op)) {
+      auto Str = getGlobalString(Op, KWD(Op) + FMT(Op->getOperand(1)) + FMT(Op->getOperand(2)));
+      auto BasePtr = Call(B, Op, RedisF, Op->getOperand(0), Str, Op->getOperand(1), Op->getOperand(2));
+      Call(B, Op, FreeF, BasePtr);
+      return true;
+
+    } else if (isa<kv::IncrByOp>(Op)) {
       auto Str = getGlobalString(Op, KWD(Op) + FMT(Op->getOperand(1)) + FMT(Op->getOperand(2)));
       auto BasePtr = Call(B, Op, RedisF, Op->getOperand(0), Str, Op->getOperand(1), Op->getOperand(2));
       Call(B, Op, FreeF, BasePtr);
