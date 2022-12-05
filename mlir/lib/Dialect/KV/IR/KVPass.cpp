@@ -188,6 +188,22 @@ MLIR_MAGIC_INCANTATIONS(KVOptimizerPass, "kv-opt", "KV Optimization")
     }
   }
 
+  void CombineSets(OpBuilder &B, Operation* firstSet, Operation* secondSet) {
+    if(isa<kv::SetOp>(firstSet)&&isa<kv::SetOp>(secondSet)) {
+      B.setInsertionPoint(secondSet);
+      std::vector<Type> res{firstSet->getResultTypes().front(),secondSet->getResultTypes().front()};
+      std::vector<Value> opers{firstSet->getOperand(0),firstSet->getOperand(1),secondSet->getOperand(1)};
+      auto msetOp=B.create<kv::MGetOp>(secondSet->getLoc(),res,opers);
+      std::vector<Value> tmp_res{msetOp.getResult(0)};
+      firstSet->replaceAllUsesWith(tmp_res);
+      tmp_res.clear();
+      tmp_res.push_back(msetOp.getResult(1));
+      secondSet->replaceAllUsesWith(tmp_res);
+      Remove(firstSet);
+      Remove(secondSet);
+    }
+  }
+
   template<typename T, typename ...O>
   std::function<Operation *(Operation *, Operation *)>
   Create(OpBuilder &Builder, bool First, O ...OpIds) {
@@ -666,10 +682,10 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
       auto Str= getGlobalString(Op,KWD(Op) + FMT(Op->getOperand(1))+FMT(Op->getOperand(2)));
       auto BasePtr=Call(B,Op,RedisF,Op->getOperand(0),Str,Op->getOperand(1),Op->getOperand(2));
       std::vector<LLVM::GEPOp> elePtrs;
-      getBitcastType(Op->getBlock());
+      //getBitcastType(Op->getBlock());
       for(int i=0;i<2;++i) {
         //need more think about the offsets.
-        auto resStr=GEP(B, Op, BasePtr, 56,0,i,);
+        auto resStr=GEP(B, Op, BasePtr, 56,0,i);
         elePtrs.push_back(resStr);
 
       }
