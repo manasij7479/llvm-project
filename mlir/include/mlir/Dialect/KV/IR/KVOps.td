@@ -49,6 +49,13 @@ def GetOp : KV_Op<"get", [NoSideEffect]> {
   let results = (outs AnyTypeOf<[I32, LLVM_AnyPointer]>:$res);
 }
 
+def KeysOp : KV_Op<"keys", [NoSideEffect]> {
+  let summary = "keys";
+  let arguments = (ins LLVM_AnyPointer:$ctx,
+                   AnyTypeOf<[I32, LLVM_AnyPointer]>:$key);
+  let results = (outs LLVM_AnyPointer:$res);
+}
+
 def HGetOp : KV_Op<"hget", [NoSideEffect]> {
   let summary = "hget";
   let arguments = (ins LLVM_AnyPointer:$ctx,

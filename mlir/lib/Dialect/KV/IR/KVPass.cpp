@@ -49,7 +49,7 @@ MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(x)       \
 mlir::Value getGlobalString(mlir::Operation *Root, StringRef Str) {
   mlir::OpBuilder B(Root->getContext());
   static int StrNum = 0;
-  auto Name = "s" + std::to_string(StrNum++);
+  auto Name = "s" + std::to_string(StrNum++) + std::to_string(std::hash<std::string>()(Str.str()) % 100);
   SmallString<16> NullTerminatedStr(Str);
   NullTerminatedStr.push_back('\0');
   B.setInsertionPoint(Root);
@@ -560,7 +560,13 @@ MLIR_MAGIC_INCANTATIONS(LLVMToKVPass, "llvm-to-kv", "LLVM to KV")
     }
 
     for (auto U : Op.getUsers()) {
-      //U->dump();
+      if (!isa<LLVM::CallOp>(U) && !isa<LLVM::GEPOp>(U)) {
+        Val.getDefiningOp()->erase();
+        return false;
+      }
+    }
+
+    for (auto U : Op.getUsers()) {
       if (isa<LLVM::CallOp>(U)) {
         U->erase();
       }
@@ -608,7 +614,7 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
 
   template<typename ValuesT>
   void ReplaceUses(mlir::OpBuilder &B, mlir::Operation *Root, ValuesT&& New,mlir::Operation* insertPoint) {
-    B.setInsertionPointAfter(insertPoint);
+    B.setInsertionPoint(insertPoint);
     // TODO: Is it possible to get the last dependent use without traversing the use tree?
     std::vector<mlir::Operation *> Stack{Root};
     std::set<mlir::Operation *> Visited;
@@ -619,7 +625,7 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
         continue;
       }
       Visited.insert(Cur);
-      B.setInsertionPointAfter(Cur);
+      B.setInsertionPoint(Cur);
       for (auto &&User : Cur->getUsers()) {
         Stack.push_back(User);
       }
@@ -655,7 +661,6 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
     } else if (isa<kv::IncrByOp>(Op)) {
       return "INCRBY ";
     } else {
-
       llvm_unreachable("Unimplemented translator");
     }
   }
@@ -678,18 +683,26 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
       Call(B, Op, FreeF, BasePtr);
       return true;
 
-    }else if(isa<kv::MGetOp>(Op)){
+    } else if (isa<kv::HGetOp>(Op)) {
+      auto Str = getGlobalString(Op, KWD(Op) + FMT(Op->getOperand(1)) + FMT(Op->getOperand(2)));
+      Value BasePtr = Call(B, Op, RedisF, Op->getOperand(0), Str, Op->getOperand(1), Op->getOperand(2));
+
+      auto Ptr = GEP(B, Op, BasePtr, 32);
+      // TODO: The index 32 is for the string result, observe the value for int and branch accordingly.
+      ReplaceUses(B, Op, Ptr,Ptr.getOperation());
+      Call(B, Op, FreeF, BasePtr);
+      return true;
+    } else if (isa<kv::MGetOp>(Op)){
       auto Str= getGlobalString(Op,KWD(Op) + FMT(Op->getOperand(1))+FMT(Op->getOperand(2)));
       auto BasePtr=Call(B,Op,RedisF,Op->getOperand(0),Str,Op->getOperand(1),Op->getOperand(2));
-      static threeStarsIntPtr=LLVM::LLVMPointerType::get(LLVM::LLVMPointerType::get(LLVM::LLVMPointerType::get(B.getI8Type())));
-      auto CastedPtr=LLVM::BitcastOp::build(B,BasePtr.getLoc(),threeStarsIntPtr,BasePtr);
+      auto threeStarsIntPtr=LLVM::LLVMPointerType::get(LLVM::LLVMPointerType::get(LLVM::LLVMPointerType::get(B.getI8Type())));
+      auto CastedPtr= B.create<LLVM::BitcastOp>(BasePtr.getLoc(), threeStarsIntPtr, BasePtr);
       std::vector<LLVM::GEPOp> elePtrs;
       //getBitcastType(Op->getBlock());
       for(int i=0;i<2;++i) {
         //need more think about the offsets.
         auto resStr=GEP(B, Op, CastedPtr, 56,0,i);
         elePtrs.push_back(resStr);
-
       }
       mlir::Operation* latest=elePtrs[0].getOperation();
       for(int i=1;i<2;++i){
