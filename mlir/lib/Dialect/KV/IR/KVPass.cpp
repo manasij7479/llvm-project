@@ -681,11 +681,13 @@ MLIR_MAGIC_INCANTATIONS(KVToLLVMPass, "kv-to-llvm", "KV to LLVM")
     }else if(isa<kv::MGetOp>(Op)){
       auto Str= getGlobalString(Op,KWD(Op) + FMT(Op->getOperand(1))+FMT(Op->getOperand(2)));
       auto BasePtr=Call(B,Op,RedisF,Op->getOperand(0),Str,Op->getOperand(1),Op->getOperand(2));
+      static threeStarsIntPtr=LLVM::LLVMPointerType::get(LLVM::LLVMPointerType::get(LLVM::LLVMPointerType::get(B.getI8Type())));
+      auto CastedPtr=LLVM::BitcastOp::build(B,BasePtr.getLoc(),threeStarsIntPtr,BasePtr);
       std::vector<LLVM::GEPOp> elePtrs;
       //getBitcastType(Op->getBlock());
       for(int i=0;i<2;++i) {
         //need more think about the offsets.
-        auto resStr=GEP(B, Op, BasePtr, 56,0,i);
+        auto resStr=GEP(B, Op, CastedPtr, 56,0,i);
         elePtrs.push_back(resStr);
 
       }
