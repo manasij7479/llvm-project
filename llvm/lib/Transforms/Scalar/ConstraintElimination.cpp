@@ -63,6 +63,11 @@ static cl::opt<bool> DumpReproducers(
     "constraint-elimination-dump-reproducers", cl::init(false), cl::Hidden,
     cl::desc("Dump IR to reproduce successful transformations."));
 
+static cl::opt<bool> EnableDivRemCoefficients(
+    "constraint-elimination-divrem-coefficients", cl::init(false), cl::Hidden,
+    cl::desc("Add linear coefficient constraints from div/rem with constant "
+             "positive divisors"));
+
 static int64_t MaxConstraintValue = std::numeric_limits<int64_t>::max();
 static int64_t MinSignedConstraintValue = std::numeric_limits<int64_t>::min();
 
@@ -1223,13 +1228,20 @@ void State::addInfoFor(BasicBlock &BB) {
       break;
     }
 
-    // Add facts from unsigned division and remainder.
-    //   urem x, n: result < n  and  result <= x
-    //   udiv x, n: result <= x
+    // Add facts from division and remainder.
+    //   For q = udiv/sdiv x, n (constant n > 0): n*q <= x < n*q + n
+    //   For r = urem x, n: 0 <= r < n, r <= x
+    //   For r = srem x, n (constant n > 0): -n < r < n
     if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
       if ((BO->getOpcode() == Instruction::URem ||
            BO->getOpcode() == Instruction::UDiv) &&
           isGuaranteedNotToBePoison(BO))
+        WorkList.push_back(FactOrCheck::getInstFact(DT.getNode(&BB), BO));
+      if (EnableDivRemCoefficients &&
+          (BO->getOpcode() == Instruction::SRem ||
+           BO->getOpcode() == Instruction::SDiv ||
+           BO->getOpcode() == Instruction::AShr ||
+           BO->getOpcode() == Instruction::LShr))
         WorkList.push_back(FactOrCheck::getInstFact(DT.getNode(&BB), BO));
     }
 
@@ -2017,6 +2029,99 @@ static bool eliminateConstraints(Function &F, DominatorTree &DT, LoopInfo &LI,
         if (BO->getOpcode() == Instruction::UDiv) {
           // udiv x, n: result <= x (quotient is at most the dividend)
           AddFact(CmpInst::ICMP_ULE, BO, BO->getOperand(0));
+          continue;
+        }
+        // Add  Constant >= Coeff_1 * V_1 + ... + Coeff_k * V_k  to the
+        // constraint system, managing new variables the same way as
+        // addFactImpl / getConstraint.
+        auto AddLinear = [&](bool IsSigned, int64_t Constant,
+                             ArrayRef<std::pair<int64_t, Value *>> Terms) {
+          auto &V2I = Info.getValue2Index(IsSigned);
+          SmallVector<Value *, 2> NewVars;
+          SmallDenseMap<Value *, unsigned> NewIndices;
+          for (auto &[Coeff, V] : Terms) {
+            if (V2I.count(V))
+              continue;
+            auto [It, Inserted] = NewIndices.try_emplace(
+                V, V2I.size() + NewVars.size() + 1);
+            if (Inserted)
+              NewVars.push_back(V);
+          }
+
+          SmallVector<int64_t, 8> C(V2I.size() + NewVars.size() + 1, 0);
+          C[0] = Constant;
+          for (auto &[Coeff, V] : Terms) {
+            auto It = V2I.find(V);
+            C[It != V2I.end() ? It->second : NewIndices[V]] = Coeff;
+          }
+
+          if (!Info.getCS(IsSigned).addVariableRowFill(C))
+            return;
+
+          SmallVector<Value *, 2> ValuesToRelease;
+          for (Value *V : NewVars) {
+            V2I.try_emplace(V, V2I.size() + 1);
+            ValuesToRelease.push_back(V);
+          }
+          DFSInStack.emplace_back(CB.NumIn, CB.NumOut, IsSigned,
+                                  std::move(ValuesToRelease));
+        };
+
+        // For sdiv/srem with constant positive divisor n, add constraints
+        // derived from the division identity  x = n * q + r:
+        //   srem:       - (n - 1) <= r <= n - 1    (|r| < n)
+        //   sdiv:       n * q - (n - 1) <= x <= n * q + (n - 1)
+        //   sdiv exact: x = n * q, as no remainder
+        if (BO->getOpcode() == Instruction::SDiv ||
+            BO->getOpcode() == Instruction::SRem) {
+          auto *CI = dyn_cast<ConstantInt>(BO->getOperand(1));
+          if (!CI)
+            continue;
+          int64_t NVal = CI->getSExtValue();
+          if (NVal <= 0 || NVal > MaxConstraintValue)
+            continue;
+
+          Value *X = BO->getOperand(0);
+          if (BO->getOpcode() == Instruction::SRem) {
+            auto *Ty = BO->getType();
+            AddFact(CmpInst::ICMP_SGE, BO,
+                    ConstantInt::getSigned(Ty, -(NVal - 1)));
+            AddFact(CmpInst::ICMP_SLE, BO,
+                    ConstantInt::getSigned(Ty, NVal - 1));
+          } else {
+            // The non-exact bound is always satisfiable (any x has a
+            // valid q = trunc(x/n)).  The tight equality x = n*q
+            // requires ruling out poison first.
+            int64_t Offset =
+                (BO->isExact() && isGuaranteedNotToBePoison(BO))
+                    ? 0
+                    : NVal - 1;
+            AddLinear(true, Offset, {{-1, X}, {NVal, BO}});
+            AddLinear(true, Offset, {{1, X}, {-NVal, BO}});
+          }
+          continue;
+        }
+        // ashr / lshr by constant k is floor(x / 2^k), with n = 2^k:
+        //   n * q <= x <= n * q + (n - 1)
+        //   exact: x = n * q
+        if (BO->getOpcode() == Instruction::AShr ||
+            BO->getOpcode() == Instruction::LShr) {
+          auto *CI = dyn_cast<ConstantInt>(BO->getOperand(1));
+          if (!CI)
+            continue;
+          uint64_t ShAmt = CI->getZExtValue();
+          if (ShAmt == 0 || ShAmt >= 63)
+            continue;
+          int64_t NVal = int64_t(1) << ShAmt;
+
+          bool IsSigned = BO->getOpcode() == Instruction::AShr;
+          Value *X = BO->getOperand(0);
+          int64_t Offset =
+              (BO->isExact() && isGuaranteedNotToBePoison(BO))
+                  ? 0
+                  : NVal - 1;
+          AddLinear(IsSigned, 0, {{-1, X}, {NVal, BO}});
+          AddLinear(IsSigned, Offset, {{1, X}, {-NVal, BO}});
           continue;
         }
       }
