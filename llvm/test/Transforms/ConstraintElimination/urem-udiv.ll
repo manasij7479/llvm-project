@@ -283,7 +283,7 @@ else:
   ret i1 false
 }
 
-; srem/sdiv are NOT handled.
+; srem without non-negativity guard on x: can't derive bounds.
 define i1 @neg_srem_not_handled(i32 noundef %x, i32 noundef %n, i32 noundef %m) {
 ; CHECK-LABEL: define i1 @neg_srem_not_handled(
 ; CHECK-SAME: i32 noundef [[X:%.*]], i32 noundef [[N:%.*]], i32 noundef [[M:%.*]]) {

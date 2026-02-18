@@ -1223,12 +1223,17 @@ void State::addInfoFor(BasicBlock &BB) {
       break;
     }
 
-    // Add facts from unsigned division and remainder.
+    // Add facts from division and remainder.
     //   urem x, n: result < n  and  result <= x
     //   udiv x, n: result <= x
+    //   srem x, n (x >=s 0): result >=s 0  and  result <=s x
+    //                         (n >=s 0): result <s n
+    //   sdiv x, n (both >=s 0): result >=s 0  and  result <=s x
     if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
       if ((BO->getOpcode() == Instruction::URem ||
-           BO->getOpcode() == Instruction::UDiv) &&
+           BO->getOpcode() == Instruction::UDiv ||
+           BO->getOpcode() == Instruction::SRem ||
+           BO->getOpcode() == Instruction::SDiv) &&
           isGuaranteedNotToBePoison(BO))
         WorkList.push_back(FactOrCheck::getInstFact(DT.getNode(&BB), BO));
     }
@@ -2021,6 +2026,37 @@ static bool eliminateConstraints(Function &F, DominatorTree &DT, LoopInfo &LI,
         if (BO->getOpcode() == Instruction::UDiv) {
           // udiv x, n: result <= x (quotient is at most the dividend)
           AddFact(CmpInst::ICMP_ULE, BO, BO->getOperand(0));
+          continue;
+        }
+        auto &DL = F.getDataLayout();
+        auto IsKnownNonNegative = [&](Value *V) {
+          return Info.doesHold(CmpInst::ICMP_SGE, V,
+                               ConstantInt::get(V->getType(), 0)) ||
+                 isKnownNonNegative(V, DL, MaxAnalysisRecursionDepth - 1);
+        };
+        if (BO->getOpcode() == Instruction::SRem) {
+          Value *X = BO->getOperand(0);
+          Value *N = BO->getOperand(1);
+          if (IsKnownNonNegative(X)) {
+            // srem x, n: result >=s 0 (sign follows non-negative dividend)
+            AddFact(CmpInst::ICMP_SGE, BO, ConstantInt::get(BO->getType(), 0));
+            // srem x, n: result <=s x (remainder magnitude <= dividend)
+            AddFact(CmpInst::ICMP_SLE, BO, X);
+            if (IsKnownNonNegative(N))
+              // srem x, n: result <s n (both non-negative, same as urem)
+              AddFact(CmpInst::ICMP_SLT, BO, N);
+          }
+          continue;
+        }
+        if (BO->getOpcode() == Instruction::SDiv) {
+          Value *X = BO->getOperand(0);
+          Value *N = BO->getOperand(1);
+          if (IsKnownNonNegative(X) && IsKnownNonNegative(N)) {
+            // sdiv x, n: result >=s 0
+            AddFact(CmpInst::ICMP_SGE, BO, ConstantInt::get(BO->getType(), 0));
+            // sdiv x, n: result <=s x (quotient <= dividend for non-negatives)
+            AddFact(CmpInst::ICMP_SLE, BO, X);
+          }
           continue;
         }
       }
